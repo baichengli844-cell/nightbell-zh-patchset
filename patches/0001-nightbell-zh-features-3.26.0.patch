@@ -1,0 +1,2495 @@
+diff --git a/.gitignore b/.gitignore
+index 48e2e45..32d7468 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,7 +10,10 @@ keystore/keystore.properties
+ 
+ # Scratch
+ *.log
+-.idea/
++# IDE project files are machine-local, except the Gradle JDK pin below. Without
++# it Android Studio 2026.2.2 picks its bundled JBR 25 and Gradle 8.13 refuses.
++**/.idea/*
++!.idea/gradle.xml
+ .DS_Store
+ 
+ # Debug APKs are 14 MB each and rebuildable; releases and their R8 mapping
+@@ -75,3 +78,8 @@ artifacts/dev/
+ # Local credentials. Never committed: the key in here is live, and a secret that
+ # reaches a public history is burned whether or not it is removed afterwards.
+ .env
++
++# Chinese fork: generated build output and coverage reports.
++/dist/
++/tools/pending.txt
++/tools/orphans.txt
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 7f905b2..c893f43 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -620,8 +620,15 @@ android {
+         // 3.25.0 says "Updated to" on the first launch of a new version, with the
+         // release notes one tap away, and keeps a What's new button for the
+         // installed version in Settings, About. Both open nightbell.app/changelog.
+-        versionCode = 54
+-        versionName = "3.25.0"
++        //
++        // 3.26.0 is the Chinese/intranet build, forked from the v3.25.0 tag. It
++        // adds a runtime EN/ZH language switch, one-second check intervals,
++        // interface capture (local HTTP proxy + optional allowlisted HTTPS
++        // inspection with an on-device CA), request/monitor logs and a current
++        // network information screen. Version bumps separately from upstream so
++        // the app's own update check never offers to "update" to 3.25.0.
++        versionCode = 55
++        versionName = "3.26.0"
+ 
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+         vectorDrawables { useSupportLibrary = true }
+@@ -799,6 +806,11 @@ dependencies {
+     implementation(libs.kotlinx.serialization.json)
+     implementation(libs.kotlinx.coroutines.android)
+     implementation(libs.okhttp)
++    // Used at runtime to mint the on-device root CA and per-host leaf
++    // certificates for optional HTTPS inspection. It is a pure-Kotlin DER
++    // codec over the JDK's Signature/KeyPairGenerator, so it works on Android
++    // without pulling in BouncyCastle.
++    implementation(libs.okhttp.tls)
+     // ProxyController, so a page-element check can be routed through SOCKS5 too.
+     implementation(libs.androidx.webkit)
+     // Reads the orientation tag off a picked photo. `BitmapFactory` ignores it,
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 6684a9f..4f9b542 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -3,6 +3,15 @@
+ 
+     <uses-permission android:name="android.permission.INTERNET" />
+     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
++    <!--
++        Network info page. ACCESS_WIFI_STATE is a normal permission (RSSI, link
++        speed, frequency). ACCESS_FINE_LOCATION is requested at runtime, only
++        when the user asks for the extra detail: Android 8+ withholds the SSID,
++        BSSID and cellular SignalStrength without it, but every other field on
++        the page works without any prompt.
++    -->
++    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
++    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+     <uses-permission android:name="android.permission.VIBRATE" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+     <uses-permission android:name="android.permission.WAKE_LOCK" />
+@@ -194,6 +203,26 @@
+                 android:value="Shows the user what an URGENT outage page will look and sound like before they have to trust it with a real outage." />
+         </service>
+ 
++        <!--
++            Interface capture. BIND_VPN_SERVICE is what lets the system hand the
++            app a TUN interface after the user grants VPN consent in
++            VpnService.prepare(). No user traffic is routed into that interface:
++            it exists so Android 10+ can announce a system HTTP proxy pointing at
++            Nightbell's own loopback proxy, which is where requests are read.
++        -->
++        <service
++            android:name=".data.capture.CaptureVpnService"
++            android:exported="true"
++            android:permission="android.permission.BIND_VPN_SERVICE"
++            android:foregroundServiceType="specialUse">
++            <intent-filter>
++                <action android:name="android.net.VpnService" />
++            </intent-filter>
++            <property
++                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
++                android:value="Runs a local, on-device HTTP proxy so the user can discover the API endpoints their phone calls and turn them into uptime monitors. An optional, user-installed local CA decrypts only the hosts the user explicitly names. No traffic is sent off the device." />
++        </service>
++
+         <receiver
+             android:name=".data.alerts.AlertActionReceiver"
+             android:exported="false">
+@@ -230,5 +259,21 @@
+                 android:name="android.appwidget.provider"
+                 android:resource="@xml/widget_nightbell_info" />
+         </receiver>
++
++        <!--
++            Shares the public capture CA certificate (PEM, no private key) so it
++            can be installed by hand on ROMs where the certificate installer
++            intent is unavailable. The authority follows applicationId so the
++            debug build can coexist with the release build.
++        -->
++        <provider
++            android:name="androidx.core.content.FileProvider"
++            android:authorities="${applicationId}.capturefiles"
++            android:exported="false"
++            android:grantUriPermissions="true">
++            <meta-data
++                android:name="android.support.FILE_PROVIDER_PATHS"
++                android:resource="@xml/capture_file_paths" />
++        </provider>
+     </application>
+ </manifest>
+diff --git a/app/src/main/kotlin/me/river/nightbell/NightbellApplication.kt b/app/src/main/kotlin/me/river/nightbell/NightbellApplication.kt
+index 774f456..fb5774c 100644
+--- a/app/src/main/kotlin/me/river/nightbell/NightbellApplication.kt
++++ b/app/src/main/kotlin/me/river/nightbell/NightbellApplication.kt
+@@ -2,14 +2,19 @@ package me.river.nightbell
+ 
+ import android.app.Application
+ import me.river.nightbell.data.Nightbell
++import me.river.nightbell.data.capture.MonitorLogRepository
+ import me.river.nightbell.data.diag.Diag
++import me.river.nightbell.domain.LanguageChoice
+ import me.river.nightbell.domain.LogEvent
+ import me.river.nightbell.domain.LogField
+ import me.river.nightbell.domain.runCatchingCancellable
++import me.river.nightbell.ui.i18n.L10n
++import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
+ 
+ class NightbellApplication : Application() {
+ 
+@@ -17,6 +22,38 @@ class NightbellApplication : Application() {
+         super.onCreate()
+         val graph = Nightbell.install(this)
+ 
++        // A scheduled check can run in a process with no Activity. Load the
++        // per-monitor request log before any worker can append to it.
++        MonitorLogRepository.init(this)
++
++        // Earliest possible: "follow system" needs an application context, and
++        // WorkManager can start a check (and post a notification) in a fresh
++        // process before any Activity exists.
++        L10n.install(this)
++        graph.appScope.launch {
++            // Wait for the real first read, like the Diag sink does. Collecting
++            // straight away would apply the in-memory default (SYSTEM) as if it
++            // were the persisted choice and could briefly show the wrong one.
++            graph.store.loadedFlow.first { it }
++            graph.store.snapshot
++                .map { it.settings.language }
++                .distinctUntilChanged()
++                .collect { choice ->
++                    // appScope runs on Dispatchers.Default. Compose reads this
++                    // state during composition, so publish it on the main thread
++                    // rather than writing a SnapshotState from a worker.
++                    withContext(Dispatchers.Main.immediate) {
++                        L10n.setLanguage(
++                            when (choice) {
++                                LanguageChoice.SYSTEM -> L10n.Lang.SYSTEM
++                                LanguageChoice.ZH -> L10n.Lang.ZH
++                                LanguageChoice.EN -> L10n.Lang.EN
++                            },
++                        )
++                    }
++                }
++        }
++
+         // Before anything else in the process can log. The sink holds a ring in
+         // memory from its first line whether or not the user has the switch on,
+         // and a check can run in a process WorkManager started, so waiting for
+diff --git a/app/src/main/kotlin/me/river/nightbell/data/alerts/AlertCenter.kt b/app/src/main/kotlin/me/river/nightbell/data/alerts/AlertCenter.kt
+index b3824b2..badd303 100644
+--- a/app/src/main/kotlin/me/river/nightbell/data/alerts/AlertCenter.kt
++++ b/app/src/main/kotlin/me/river/nightbell/data/alerts/AlertCenter.kt
+@@ -24,6 +24,7 @@ import androidx.core.content.ContextCompat
+ import me.river.nightbell.MainActivity
+ import me.river.nightbell.UrgentAlertActivity
+ import me.river.nightbell.R
++import me.river.nightbell.ui.i18n.L10n
+ import java.text.SimpleDateFormat
+ import java.util.Date
+ import java.util.Locale
+@@ -96,7 +97,7 @@ class AlertCenter(private val context: Context) {
+             )
+             .addAction(
+                 R.drawable.ic_stat_mute,
+-                "Mute 1h",
++                L10n.pick("Mute 1h", "静音 1 小时"),
+                 AlertActionReceiver.pendingIntent(context, AlertActionReceiver.ACTION_MUTE_1H, monitor.id),
+             )
+             .build()
+@@ -125,7 +126,7 @@ class AlertCenter(private val context: Context) {
+         val style = NotificationCompat.InboxStyle()
+         result.alerts.take(ALERT_LINES).forEach { style.addLine(it.line) }
+         val hidden = result.alerts.size - ALERT_LINES
+-        if (hidden > 0) style.setSummaryText("and $hidden more")
++        if (hidden > 0) style.setSummaryText(L10n.pick("and $hidden more", "另有 $hidden 条"))
+         return style
+     }
+ 
+@@ -140,7 +141,7 @@ class AlertCenter(private val context: Context) {
+         val style = NotificationCompat.InboxStyle()
+         lines.take(ALERT_LINES).forEach { style.addLine(it) }
+         val hidden = lines.size - ALERT_LINES
+-        if (hidden > 0) style.setSummaryText("and $hidden more")
++        if (hidden > 0) style.setSummaryText(L10n.pick("and $hidden more", "另有 $hidden 条"))
+         return style
+     }
+ 
+@@ -148,7 +149,7 @@ class AlertCenter(private val context: Context) {
+         val channelId = channelFor(policy, Severity.RECOVERY, silent)
+         val notification = baseBuilder(channelId, monitor, silent)
+             .setSmallIcon(R.drawable.ic_stat_ok)
+-            .setContentTitle("${monitor.displayName} is back")
++            .setContentTitle(L10n.pick("${monitor.displayName} is back", "${monitor.displayName} 已恢复"))
+             .setContentText(result.message.ifBlank { "Responding normally again" })
+             .setStyle(
+                 NotificationCompat.BigTextStyle().bigText(
+@@ -183,7 +184,7 @@ class AlertCenter(private val context: Context) {
+         val body = result.message.ifBlank { result.failureKind.headline }
+         val notification = NotificationCompat.Builder(context, channelId)
+             .setSmallIcon(R.drawable.ic_stat_alert)
+-            .setContentTitle("URGENT · ${monitor.displayName} is down")
++            .setContentTitle(L10n.pick("URGENT · ${monitor.displayName} is down", "紧急 · ${monitor.displayName} 已故障"))
+             .setContentText(body)
+             .setStyle(
+                 NotificationCompat.BigTextStyle().bigText(
+@@ -490,7 +491,7 @@ class AlertCenter(private val context: Context) {
+                 )
+                 .addAction(
+                     R.drawable.ic_stat_mute,
+-                    "Mute 1h",
++                    L10n.pick("Mute 1h", "静音 1 小时"),
+                     AlertActionReceiver.pendingIntent(context, AlertActionReceiver.ACTION_MUTE_1H, monitor.id),
+                 )
+                 .build()
+@@ -519,7 +520,7 @@ class AlertCenter(private val context: Context) {
+                 )
+                 .addAction(
+                     R.drawable.ic_stat_mute,
+-                    "Mute 1h",
++                    L10n.pick("Mute 1h", "静音 1 小时"),
+                     AlertActionReceiver.pendingIntent(context, AlertActionReceiver.ACTION_MUTE_1H, monitor.id),
+                 )
+                 .build()
+@@ -535,7 +536,7 @@ class AlertCenter(private val context: Context) {
+                     "${monitor.displayName} is slow"
+                 },
+             )
+-            .setContentText("${result.latencyMs} ms — budget is $sloMs ms")
++            .setContentText(L10n.pick("${result.latencyMs} ms — budget is $sloMs ms", "${result.latencyMs} ms — 预算 $sloMs ms"))
+             .setStyle(
+                 NotificationCompat.BigTextStyle().bigText(
+                     buildString {
+@@ -556,7 +557,7 @@ class AlertCenter(private val context: Context) {
+             )
+             .addAction(
+                 R.drawable.ic_stat_mute,
+-                "Mute 1h",
++                L10n.pick("Mute 1h", "静音 1 小时"),
+                 AlertActionReceiver.pendingIntent(context, AlertActionReceiver.ACTION_MUTE_1H, monitor.id),
+             )
+             .build()
+@@ -699,8 +700,8 @@ class AlertCenter(private val context: Context) {
+         val quiet = silent || repeat
+         val notification = NotificationCompat.Builder(context, channelId)
+             .setSmallIcon(R.drawable.ic_stat_alert)
+-            .setContentTitle("Nightbell can't complete its checks")
+-            .setContentText("${state.consecutiveErrors} checks in a row failed inside Nightbell itself")
++            .setContentTitle(L10n.pick("Nightbell can't complete its checks", "Nightbell 无法完成检查"))
++            .setContentText(L10n.pick("${state.consecutiveErrors} checks in a row failed inside Nightbell itself", "Nightbell 内部连续 ${state.consecutiveErrors} 次检查失败"))
+             .setStyle(
+                 NotificationCompat.BigTextStyle().bigText(
+                     buildString {
+@@ -759,8 +760,8 @@ class AlertCenter(private val context: Context) {
+     fun notifySignInNeeded(monitor: Monitor, problem: AuthProblem) {
+         val notification = NotificationCompat.Builder(context, signInChannel())
+             .setSmallIcon(R.drawable.ic_stat_brand)
+-            .setContentTitle("${monitor.displayName} is not checking")
+-            .setContentText("${problem.headline}. Open the monitor to sign in again.")
++            .setContentTitle(L10n.pick("${monitor.displayName} is not checking", "${monitor.displayName} 未在进行检查"))
++            .setContentText(L10n.pick("${problem.headline}. Open the monitor to sign in again.", "${problem.headline}。请打开监控重新登录。"))
+             .setContentIntent(openMonitorIntent(monitor.id))
+             .setCategory(NotificationCompat.CATEGORY_STATUS)
+             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+@@ -1057,8 +1058,8 @@ class AlertCenter(private val context: Context) {
+         )
+         val notification = NotificationCompat.Builder(context, channelId)
+             .setSmallIcon(R.drawable.ic_stat_brand)
+-            .setContentTitle("Nightbell update available")
+-            .setContentText("Version ${release.version} is ready")
++            .setContentTitle(L10n.pick("Nightbell update available", "Nightbell 有新版本"))
++            .setContentText(L10n.pick("Version ${release.version} is ready", "版本 ${release.version} 已就绪"))
+             .setStyle(
+                 NotificationCompat.BigTextStyle()
+                     .bigText(AppUpdate.noticeBody(release, installedVersion)),
+@@ -1226,8 +1227,8 @@ class AlertCenter(private val context: Context) {
+         val channelId = channelFor(policy, Severity.DOWN, silent = false)
+         val notification = NotificationCompat.Builder(context, channelId)
+             .setSmallIcon(R.drawable.ic_stat_alert)
+-            .setContentTitle("$monitorName is down")
+-            .setContentText("This is what a real alert looks like.")
++            .setContentTitle(L10n.pick("$monitorName is down", "$monitorName 已故障"))
++            .setContentText(L10n.pick("This is what a real alert looks like.", "这是一条真实告警的预览。"))
+             .setStyle(
+                 NotificationCompat.BigTextStyle()
+                     .bigText("Sound: ${policy.sound.label}\nHaptics: ${if (policy.vibrate) policy.vibrationStyle.label else "off"}"),
+diff --git a/app/src/main/kotlin/me/river/nightbell/data/alerts/UrgentPageStyles.kt b/app/src/main/kotlin/me/river/nightbell/data/alerts/UrgentPageStyles.kt
+index bf0c432..5fae8a9 100644
+--- a/app/src/main/kotlin/me/river/nightbell/data/alerts/UrgentPageStyles.kt
++++ b/app/src/main/kotlin/me/river/nightbell/data/alerts/UrgentPageStyles.kt
+@@ -15,6 +15,7 @@ import androidx.core.app.Person
+ import androidx.core.graphics.createBitmap
+ import androidx.core.graphics.drawable.IconCompat
+ import me.river.nightbell.R
++import me.river.nightbell.ui.i18n.L10n
+ 
+ /**
+  * The five candidate looks for the URGENT heads-up — the container that drops
+@@ -217,8 +218,8 @@ object UrgentPageStyles {
+         val notification = callDarkRed(context, channelId, content, actions, silent)
+         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return notification
+         val existing = notification.actions ?: return notification
+-        val ack = context.getString(R.string.urgent_action_acknowledge_short)
+-        val recheck = context.getString(R.string.urgent_action_recheck)
++        val ack = L10n.res(context, R.string.urgent_action_acknowledge_short, "确认")
++        val recheck = L10n.res(context, R.string.urgent_action_recheck, "重新检查")
+         notification.actions = existing.mapIndexed { index, action ->
+             val title = when (index) {
+                 // CallStyle emits negative-then-positive, and appends the app's
+@@ -245,26 +246,26 @@ object UrgentPageStyles {
+         val builder = base(context, channelId, content, actions, silent)
+             .setColor(DEEP_DOWN_COLOR)
+             .setColorized(true)
+-            .setContentTitle("${content.monitorName} is down")
++            .setContentTitle(L10n.pick("${content.monitorName} is down", "${content.monitorName} 已故障"))
+             .setContentText(
+                 buildString {
+                     append(content.headline)
+-                    if (content.downFor.isNotBlank()) append(" · down for ").append(content.downFor)
++                    if (content.downFor.isNotBlank()) append(L10n.pick(" · down for ", " · 已故障 ")).append(content.downFor)
+                 },
+             )
+             .setStyle(NotificationCompat.BigTextStyle().bigText(bigText(content)))
+             .addAction(
+                 R.drawable.ic_stat_ok,
+-                context.getString(R.string.urgent_action_acknowledge_short),
++                L10n.res(context, R.string.urgent_action_acknowledge_short, "确认"),
+                 actions.acknowledge,
+             )
+             .addAction(
+                 R.drawable.ic_stat_refresh,
+-                context.getString(R.string.urgent_action_recheck),
++                L10n.res(context, R.string.urgent_action_recheck, "重新检查"),
+                 actions.recheck,
+             )
+         actions.mute?.let {
+-            builder.addAction(R.drawable.ic_stat_mute, "Mute 1h", it)
++            builder.addAction(R.drawable.ic_stat_mute, L10n.pick("Mute 1h", "静音 1 小时"), it)
+         }
+         return builder.build()
+     }
+@@ -285,12 +286,12 @@ object UrgentPageStyles {
+         // have the height, carry the controls. Hiding the row rather than shipping a
+         // second layout keeps the two from drifting.
+         fun card(withActions: Boolean) = RemoteViews(context.packageName, R.layout.notification_urgent_call).apply {
+-            setTextViewText(R.id.urgent_name, "${content.monitorName} is down")
++            setTextViewText(R.id.urgent_name, L10n.pick("${content.monitorName} is down", "${content.monitorName} 已故障"))
+             setTextViewText(
+                 R.id.urgent_detail,
+                 buildString {
+                     append(content.headline)
+-                    if (content.downFor.isNotBlank()) append(" · down for ").append(content.downFor)
++                    if (content.downFor.isNotBlank()) append(L10n.pick(" · down for ", " · 已故障 ")).append(content.downFor)
+                 },
+             )
+             if (!withActions) {
+@@ -306,7 +307,7 @@ object UrgentPageStyles {
+                 UrgentPills.iconLabel(
+                     context = context,
+                     iconRes = R.drawable.ic_stat_ok,
+-                    text = context.getString(R.string.urgent_action_acknowledge_short),
++                    text = L10n.res(context, R.string.urgent_action_acknowledge_short, "确认"),
+                     fill = ACK_PILL_COLOR,
+                     textColor = 0xFFFFFFFF.toInt(),
+                     tint = 0xFFFFFFFF.toInt(),
+@@ -317,7 +318,7 @@ object UrgentPageStyles {
+                 UrgentPills.iconLabel(
+                     context = context,
+                     iconRes = R.drawable.ic_stat_refresh,
+-                    text = context.getString(R.string.urgent_action_recheck),
++                    text = L10n.res(context, R.string.urgent_action_recheck, "重新检查"),
+                     fill = RECHECK_PILL_COLOR,
+                     textColor = 0xFFFFFFFF.toInt(),
+                     tint = 0xFFFFFFFF.toInt(),
+@@ -351,7 +352,7 @@ object UrgentPageStyles {
+         }
+         val expanded = card(withActions = true)
+         return base(context, channelId, content, actions, silent)
+-            .setContentTitle("${content.monitorName} is down")
++            .setContentTitle(L10n.pick("${content.monitorName} is down", "${content.monitorName} 已故障"))
+             .setContentText(content.headline)
+             .setCustomContentView(card(withActions = false))
+             .setCustomHeadsUpContentView(expanded)
+@@ -380,7 +381,7 @@ object UrgentPageStyles {
+         val builder = base(context, channelId, content, actions, silent)
+             .setColor(DEEP_DOWN_COLOR)
+             .setContentTitle(content.monitorName)
+-            .setContentText("${content.headline} · down for ${content.downFor}")
++            .setContentText(L10n.pick("${content.headline} · down for ${content.downFor}", "${content.headline} · 已故障 ${content.downFor}"))
+             .setColorized(true)
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+             builder.setStyle(
+@@ -393,7 +394,7 @@ object UrgentPageStyles {
+         }
+         // CallStyle appends app actions after its own two, so the mute control can
+         // ride along even though the style will not let its labels be changed.
+-        actions.mute?.let { builder.addAction(R.drawable.ic_stat_mute, "Mute 1h", it) }
++        actions.mute?.let { builder.addAction(R.drawable.ic_stat_mute, L10n.pick("Mute 1h", "静音 1 小时"), it) }
+         return builder.build()
+     }
+ 
+@@ -413,7 +414,7 @@ object UrgentPageStyles {
+             .build()
+         val builder = base(context, channelId, content, actions, silent)
+             .setContentTitle(content.monitorName)
+-            .setContentText("${content.headline} · down for ${content.downFor}")
++            .setContentText(L10n.pick("${content.headline} · down for ${content.downFor}", "${content.headline} · 已故障 ${content.downFor}"))
+             // Only honoured when this is posted as a foreground-service
+             // notification; harmless (and ignored) otherwise.
+             .setColorized(true)
+@@ -478,7 +479,7 @@ object UrgentPageStyles {
+     ): Notification {
+         val views = urgentViews(context, content)
+         return base(context, channelId, content, actions, silent)
+-            .setContentTitle("${content.monitorName} is down")
++            .setContentTitle(L10n.pick("${content.monitorName} is down", "${content.monitorName} 已故障"))
+             .setContentText(content.headline)
+             .setCustomContentView(views)
+             .setCustomHeadsUpContentView(views)
+@@ -531,7 +532,7 @@ object UrgentPageStyles {
+         val person = monitorAsPerson(context, content)
+         val builder = base(context, channelId, content, actions, silent)
+             .setContentTitle(content.monitorName)
+-            .setContentText("Down for ${content.downFor} · ${content.headline}")
++            .setContentText(L10n.pick("Down for ${content.downFor} · ${content.headline}", "已故障 ${content.downFor} · ${content.headline}"))
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+             builder.setStyle(
+                 NotificationCompat.CallStyle.forOngoingCall(person, actions.acknowledge),
+@@ -553,11 +554,11 @@ object UrgentPageStyles {
+         actions: UrgentPageActions,
+         silent: Boolean,
+     ): Notification = base(context, channelId, content, actions, silent)
+-        .setContentTitle("${content.monitorName} is DOWN")
+-        .setContentText("${content.headline} · down for ${content.downFor}")
++        .setContentTitle(L10n.pick("${content.monitorName} is DOWN", "${content.monitorName} 已故障"))
++        .setContentText(L10n.pick("${content.headline} · down for ${content.downFor}", "${content.headline} · 已故障 ${content.downFor}"))
+         .setStyle(NotificationCompat.BigTextStyle().bigText(bigText(content)))
+         .setColorized(true)
+-        .setSubText("URGENT")
++        .setSubText(L10n.pick("URGENT", "紧急"))
+         .addAction(R.drawable.ic_stat_ok, "Acknowledge", actions.acknowledge)
+         .addAction(R.drawable.ic_stat_refresh, "Re-check", actions.recheck)
+         .build()
+@@ -571,10 +572,10 @@ object UrgentPageStyles {
+         actions: UrgentPageActions,
+         silent: Boolean,
+     ): Notification = base(context, channelId, content, actions, silent)
+-        .setContentTitle("🔴 ${content.monitorName} is down")
+-        .setContentText("${content.headline} · ${content.failedChecks} failed checks")
++        .setContentTitle(L10n.pick("🔴 ${content.monitorName} is down", "🔴 ${content.monitorName} 已故障"))
++        .setContentText(L10n.pick("${content.headline} · ${content.failedChecks} failed checks", "${content.headline} · ${content.failedChecks} 次检查失败"))
+         .setStyle(NotificationCompat.BigTextStyle().bigText(bigText(content)))
+-        .setSubText("URGENT · repeats every ${content.repeatMinutes.coerceAtLeast(1)} min")
++        .setSubText(L10n.pick("URGENT · repeats every ${content.repeatMinutes.coerceAtLeast(1)} min", "紧急 · 每 ${content.repeatMinutes.coerceAtLeast(1)} 分钟重复一次"))
+         .addAction(R.drawable.ic_stat_ok, "Acknowledge", actions.acknowledge)
+         .addAction(R.drawable.ic_stat_refresh, "Re-check", actions.recheck)
+         .build()
+@@ -590,7 +591,7 @@ object UrgentPageStyles {
+     ): Notification {
+         val heads = urgentViews(context, content)
+         return base(context, channelId, content, actions, silent)
+-            .setContentTitle("${content.monitorName} is down")
++            .setContentTitle(L10n.pick("${content.monitorName} is down", "${content.monitorName} 已故障"))
+             .setContentText(content.headline)
+             .setStyle(NotificationCompat.DecoratedCustomViewStyle())
+             .setCustomContentView(heads)
+@@ -639,15 +640,19 @@ object UrgentPageStyles {
+     /** The red band shared by the two custom-view variants. */
+     private fun urgentViews(context: Context, content: UrgentPageContent): RemoteViews =
+         RemoteViews(context.packageName, R.layout.notification_urgent).apply {
+-            setTextViewText(R.id.urgent_name, "${content.monitorName} is DOWN")
++            setTextViewText(R.id.urgent_name, L10n.pick("${content.monitorName} is DOWN", "${content.monitorName} 已故障"))
+             setTextViewText(
+                 R.id.urgent_detail,
+-                "${content.headline} · down for ${content.downFor}",
++                L10n.pick("${content.headline} · down for ${content.downFor}", "${content.headline} · 已故障 ${content.downFor}"),
+             )
+             setTextViewText(
+                 R.id.urgent_meta,
+-                "${content.failedChecks} failed checks · repeats every " +
+-                    "${content.repeatMinutes.coerceAtLeast(1)} min",
++                L10n.pick(
++                    "${content.failedChecks} failed checks · repeats every " +
++                        "${content.repeatMinutes.coerceAtLeast(1)} min",
++                    "${content.failedChecks} 次检查失败 · 每隔 " +
++                        "${content.repeatMinutes.coerceAtLeast(1)} 分钟",
++                ),
+             )
+         }
+ 
+diff --git a/app/src/main/kotlin/me/river/nightbell/data/check/CheckEngine.kt b/app/src/main/kotlin/me/river/nightbell/data/check/CheckEngine.kt
+index 3bd1e85..d9526bd 100644
+--- a/app/src/main/kotlin/me/river/nightbell/data/check/CheckEngine.kt
++++ b/app/src/main/kotlin/me/river/nightbell/data/check/CheckEngine.kt
+@@ -1,5 +1,6 @@
+ package me.river.nightbell.data.check
+ 
++import me.river.nightbell.data.capture.MonitorLogRepository
+ import me.river.nightbell.data.diag.Diag
+ import me.river.nightbell.domain.DataSaver
+ import me.river.nightbell.domain.LogEvent
+@@ -147,6 +148,21 @@ class CheckEngine(
+     var quickRetryGapMs: Long = QuickRetry.GAP_MS
+     var quickRetryBudgetMs: Long = QuickRetry.BUDGET_MS
+ 
++    /**
++     * Wall clock of the last reference probe *attempt*.
++     *
++     * [NetworkBaseline.needsProbe] cannot apply its minimum interval to an empty
++     * window — it has no newest reading to compare against — and a failed probe
++     * contributes no reading either (by design: a blocked reference is not a
++     * measurement of latency). On a network where the reference URL is
++     * unreachable, which is the normal case on an intranet, that combination
++     * made it return true on *every* pass. A one-second monitor then paid a
++     * four-second reference timeout before each check, and its samples landed
++     * roughly five seconds apart. Gate the attempt itself, not just the reading.
++     */
++    @Volatile
++    private var lastReferenceProbeMs = 0L
++
+     /**
+      * Where webhook events are queued. Null switches webhooks off, which is what
+      * every test that is not about them wants. Set by the graph rather than
+@@ -471,7 +487,14 @@ class CheckEngine(
+         run(monitorId, force, PassWitness())
+ 
+     private suspend fun run(monitorId: String, force: Boolean, witness: PassWitness): CheckResult? =
+-        locks.getOrPut(monitorId) { Mutex() }.withLock { runLocked(monitorId, force, witness) }
++        locks.getOrPut(monitorId) { Mutex() }.withLock {
++            runLocked(monitorId, force, witness).also { result ->
++                // Both the single-monitor path and runAllDue go through here, so
++                // every check leaves its status, timing and body preview behind
++                // for that monitor's request log in the detail screen.
++                if (result != null) MonitorLogRepository.recordCheck(monitorId, result)
++            }
++        }
+ 
+     /**
+      * One reading of whether this phone can reach anything, shared for as long
+@@ -576,7 +599,7 @@ class CheckEngine(
+             LogField.monitor(monitorId),
+             LogField.of("kind", monitor.kind),
+             LogField.of("forced", force),
+-            LogField.of("interval_min", monitor.intervalMinutes),
++            LogField.of("interval_s", (monitor.intervalMs / 1000L).toInt()),
+             LogField.of("urgent", monitor.urgent),
+         )
+         store.markChecking(monitorId, true)
+@@ -1294,8 +1317,14 @@ class CheckEngine(
+ 
+         referenceLock.withLock {
+             val interval = REFERENCE_MIN_INTERVAL_MS shl referenceFailures.coerceAtMost(6)
++            val now = nowMs()
+             val readings = store.currentSnapshot().reference
+-            if (!NetworkBaseline.needsProbe(readings, nowMs(), interval)) return
++            if (!NetworkBaseline.needsProbe(readings, now, interval)) return
++            // Even with an empty (or permanently failing) window, never spend a
++            // multi-second probe more than once per interval. A sub-minute monitor
++            // must not have its cadence decided by a latency control it cannot use.
++            if (now - lastReferenceProbeMs < interval) return
++            lastReferenceProbeMs = now
+             val rtt = probe.probe(settings.latencyReferenceUrl)
+             referenceFailures = if (rtt == null) (referenceFailures + 1).coerceAtMost(6) else 0
+             store.updateReference { NetworkBaseline.record(it, rtt, nowMs()) }
+@@ -2020,7 +2049,16 @@ class CheckEngine(
+      * flag exists so a human can say "check now", not "check even though it
+      * cannot possibly succeed".
+      */
+-    suspend fun runAllDue(force: Boolean = false): Int {
++    suspend fun runAllDue(
++        force: Boolean = false,
++        /**
++         * The latency reference is an external round trip with a four-second
++         * timeout. The sub-minute loop fires every second and must not pay for
++         * it; the housekeeping loop and the workers still refresh it on their
++         * own (much slower) rhythm.
++         */
++        refreshLatencyReference: Boolean = true,
++    ): Int {
+         if (!isOnline()) {
+             Diag.log(LogEvent.CHECK_SKIPPED, LogField.tag("why", "offline_pass"))
+             return 0
+@@ -2034,7 +2072,7 @@ class CheckEngine(
+             return 0
+         }
+         // Once, before the loop: the whole pass shares one reading of the control.
+-        refreshReference()
++        if (refreshLatencyReference) refreshReference()
+         val snapshot = store.currentSnapshot()
+         val now = nowMs()
+         var ran = 0
+@@ -2069,7 +2107,7 @@ class CheckEngine(
+         nowMs: Long = nowMs(),
+     ): Boolean {
+         if (!monitor.runs) return false
+-        if (DueCheck.isDue(monitor.intervalMinutes, runtime?.lastCheckedAt ?: 0L, nowMs)) return true
++        if (DueCheck.isDueMillis(monitor.intervalMs, runtime?.lastCheckedAt ?: 0L, nowMs)) return true
+         // A failure still short of its threshold is due again well before its
+         // interval. Answered here rather than by each caller so the in-lock gate,
+         // the worker's gate and the strict service all agree on it. No pause is
+@@ -2202,7 +2240,8 @@ class CheckEngine(
+                 val due = if (runtime == null || runtime.lastCheckedAt <= 0L) {
+                     0L
+                 } else {
+-                    runtime.lastCheckedAt + monitor.intervalMinutes * 60_000L - DUE_SLACK_MS - now
++                    runtime.lastCheckedAt + monitor.intervalMs -
++                        DueCheck.slackFor(monitor.intervalMs) - now
+                 }
+                 soonest = minOf(soonest, due)
+                 if (runtime != null) {
+@@ -2393,7 +2432,6 @@ class CheckEngine(
+ 
+         /** A detail line can be a response body. A channel gets the start of it. */
+         private const val WEBHOOK_DETAIL_CHARS = 500
+-        private const val DUE_SLACK_MS = DueCheck.SLACK_MS
+ 
+         /** Never wake more often than this, however tight the configured cadence. */
+         const val MIN_TICK_MS = 15_000L
+diff --git a/app/src/main/kotlin/me/river/nightbell/data/check/HttpChecker.kt b/app/src/main/kotlin/me/river/nightbell/data/check/HttpChecker.kt
+index 2a41dd9..4b3db61 100644
+--- a/app/src/main/kotlin/me/river/nightbell/data/check/HttpChecker.kt
++++ b/app/src/main/kotlin/me/river/nightbell/data/check/HttpChecker.kt
+@@ -1,6 +1,7 @@
+ package me.river.nightbell.data.check
+ 
+ import me.river.nightbell.data.auth.ProviderHttp
++import me.river.nightbell.data.capture.readableBody
+ import me.river.nightbell.data.diag.Diag
+ import me.river.nightbell.domain.LogEvent
+ import me.river.nightbell.domain.LogField
+@@ -132,11 +133,19 @@ class HttpChecker(
+         // rendezvous circuit, which says nothing about the monitored service, and
+         // the ordinary 15s reads a perfectly healthy hidden service as down.
+         val timeout = monitor.effectiveTimeoutSeconds(settings, proxied = endpoint != null)
++        // A sub-minute cadence cannot afford the ordinary "+5s" call budget or a
++        // replayed connection: with a 1s interval and a 1s timeout, six seconds
++        // plus a retry is exactly what turned "every second" into "every five
++        // seconds". Cap the whole call at the timeout the user chose; a stale
++        // keep-alive socket fails this pass and the next one is only a second away.
++        val subMinute = monitor.isSubMinute
++        val callBudgetSeconds = if (subMinute) timeout.toLong() else (timeout + 5).toLong()
+         val builder = base.newBuilder()
+             .connectTimeout(timeout.toLong(), TimeUnit.SECONDS)
+             .readTimeout(timeout.toLong(), TimeUnit.SECONDS)
+             .writeTimeout(timeout.toLong(), TimeUnit.SECONDS)
+-            .callTimeout((timeout + 5).toLong(), TimeUnit.SECONDS)
++            .callTimeout(callBudgetSeconds, TimeUnit.SECONDS)
++            .retryOnConnectionFailure(!subMinute)
+             .followRedirects(monitor.followRedirects)
+             .followSslRedirects(monitor.followRedirects)
+             .apply { if (endpoint != null) proxy(socksProxy(endpoint)) }
+@@ -177,7 +186,8 @@ class HttpChecker(
+         }
+         attempt(
+             client, request, monitor, timeout, tlsSession,
+-            retriesLeft = 1, pinnedTo = certPin, previewChars = previewChars,
++            retriesLeft = if (subMinute) 0 else 1,
++            pinnedTo = certPin, previewChars = previewChars,
+         )
+     }
+ 
+@@ -373,8 +383,16 @@ class HttpChecker(
+         // PrometheusCheck.requestUrl for why the path is this app's business.
+         val url = if (prometheus) PrometheusCheck.requestUrl(monitor) else monitor.url.trim()
+         val builder = Request.Builder().url(url)
++        // A monitor created from a captured request inherits its headers. If the
++        // captured client asked for gzip/br itself, OkHttp stops doing transparent
++        // gunzip: byteStream() then hands us compressed bytes, and decoding those
++        // as UTF-8 is exactly the "response is gibberish" seen in per-second logs.
++        // Hop-by-hop and framing headers are the old connection's, not ours.
+         monitor.headers.filterNot { it.isBlank }.forEach { header ->
+-            builder.header(header.name.trim(), header.value.trim())
++            val name = header.name.trim()
++            if (name.lowercase() !in REPLAY_SKIP_HEADERS) {
++                builder.header(name, header.value.trim())
++            }
+         }
+         if (monitor.headers.none { it.name.equals("User-Agent", true) }) {
+             builder.header("User-Agent", USER_AGENT)
+@@ -452,7 +470,10 @@ class HttpChecker(
+             try {
+                 builder.build().newCall(call).execute().use { response ->
+                     val bytes = readBoundedBytes(response, PROVIDER_BODY_BYTES)
+-                    ProviderHttp.Answer(response.code, bytes.toString(Charsets.UTF_8))
++                    ProviderHttp.Answer(
++                        response.code,
++                        readableBody(bytes, response.header("Content-Encoding"), PROVIDER_BODY_BYTES),
++                    )
+                 }
+             } catch (cancellation: CancellationException) {
+                 throw cancellation
+@@ -475,7 +496,9 @@ class HttpChecker(
+     ): CheckResult {
+         val bytes = readBoundedBytes(response, HealthFormat.MAX_BODY_BYTES + 1)
+         val oversize = bytes.size > HealthFormat.MAX_BODY_BYTES
+-        val body = if (oversize) "" else bytes.toString(Charsets.UTF_8)
++        val body = if (oversize) "" else readableBody(
++            bytes, response.header("Content-Encoding"), HealthFormat.MAX_BODY_BYTES,
++        )
+         val reading = HealthFormat.parse(
+             status = response.code,
+             body = body,
+@@ -537,7 +560,10 @@ class HttpChecker(
+             out.write(buffer, 0, allowed)
+             total += allowed
+         }
+-        return out.toString("UTF-8")
++        // Decode from the bytes, not from a String: gzip/br payloads and legacy
++        // GBK responses both become readable instead of a wall of replacement
++        // characters in the per-second request log.
++        return readableBody(out.toByteArray(), response.header("Content-Encoding"), MAX_BODY_BYTES)
+     }
+ 
+     /**
+@@ -767,5 +793,12 @@ class HttpChecker(
+         private const val PROVIDER_BODY_BYTES = 64 * 1024
+         private const val MAX_PREVIEW = 4_000
+         const val USER_AGENT = "NightbellMonitor/1.0 (Android)"
++
++        /** Headers belonging to the captured connection, never to a live check. */
++        private val REPLAY_SKIP_HEADERS = setOf(
++            "accept-encoding", "content-length", "transfer-encoding", "host",
++            "connection", "proxy-connection", "proxy-authorization", "keep-alive",
++            "te", "trailer", "upgrade", "expect",
++        )
+     }
+ }
+diff --git a/app/src/main/kotlin/me/river/nightbell/data/health/SystemLimits.kt b/app/src/main/kotlin/me/river/nightbell/data/health/SystemLimits.kt
+index c01afea..968c856 100644
+--- a/app/src/main/kotlin/me/river/nightbell/data/health/SystemLimits.kt
++++ b/app/src/main/kotlin/me/river/nightbell/data/health/SystemLimits.kt
+@@ -50,6 +50,7 @@ class SystemLimits(
+             MonitorCadence(
+                 intervalMinutes = monitor.intervalMinutes,
+                 ageMs = (nowMs - last).coerceAtLeast(0L),
++                intervalMs = monitor.intervalMs,
+             )
+         }
+         return CheckerFacts(
+diff --git a/app/src/main/kotlin/me/river/nightbell/data/work/MonitorWorkers.kt b/app/src/main/kotlin/me/river/nightbell/data/work/MonitorWorkers.kt
+index 99c76f6..a6db7f2 100644
+--- a/app/src/main/kotlin/me/river/nightbell/data/work/MonitorWorkers.kt
++++ b/app/src/main/kotlin/me/river/nightbell/data/work/MonitorWorkers.kt
+@@ -229,7 +229,11 @@ class MonitorScheduler(private val context: Context) {
+             return
+         }
+         clearIfDead(periodicName(monitor.id))
+-        val minutes = monitor.intervalMinutes.toLong().coerceAtLeast(MIN_PERIODIC_MINUTES)
++        // A sub-minute monitor lands on the 15-minute floor here. That is not a
++        // lost cadence: NightbellMonitorService's fast loop holds it, and this
++        // periodic work stays armed as the repair sweep if that service is
++        // killed. WorkManager simply cannot express an interval this short.
++        val minutes = (monitor.intervalMs / 60_000L).coerceAtLeast(MIN_PERIODIC_MINUTES)
+         val request = PeriodicWorkRequestBuilder<MonitorWorker>(minutes, TimeUnit.MINUTES)
+             .setInputData(workDataOf(MonitorWorker.KEY_MONITOR_ID to monitor.id))
+             .setConstraints(constraints(settings))
+diff --git a/app/src/main/kotlin/me/river/nightbell/data/work/NightbellMonitorService.kt b/app/src/main/kotlin/me/river/nightbell/data/work/NightbellMonitorService.kt
+index 6140617..6e43b7d 100644
+--- a/app/src/main/kotlin/me/river/nightbell/data/work/NightbellMonitorService.kt
++++ b/app/src/main/kotlin/me/river/nightbell/data/work/NightbellMonitorService.kt
+@@ -39,6 +39,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
++import java.util.concurrent.atomic.AtomicBoolean
+ 
+ /**
+  * Strict monitoring: a foreground service that keeps its own cadence instead of
+@@ -149,6 +150,7 @@ class NightbellMonitorService : Service() {
+ 
+         if (loop == null) {
+             loop = scope.launch { runLoop() }
++            scope.launch { runFastLoop() }
+             watcher = scope.launch { watchLiveCard() }
+         } else {
+             wake()
+@@ -170,7 +172,12 @@ class NightbellMonitorService : Service() {
+             // notification claiming the fleet was being watched, which is the one
+             // lie a monitoring app cannot afford. Resuming starts it again, the
+             // same way enabling a monitor does.
+-            val strict = snapshot.settings.strictForegroundMonitoring &&
++            // A sub-minute monitor cannot be held by WorkManager's 15-minute
++            // floor, so it earns the foreground service on its own whether or
++            // not the global strict switch is on. Otherwise "every second" would
++            // be a promise the app could not keep.
++            val fast = snapshot.monitors.any { it.enabled && it.isSubMinute }
++            val strict = (snapshot.settings.strictForegroundMonitoring || fast) &&
+                 snapshot.monitors.any { it.enabled } &&
+                 !snapshot.pause.stopsChecks(System.currentTimeMillis())
+             val nagging = snapshot.monitors.any { monitor ->
+@@ -197,7 +204,10 @@ class NightbellMonitorService : Service() {
+                 LogField.of("strict", strict),
+                 LogField.of("paging", isPaging()),
+             )
+-            if (strict) {
++            // With a sub-minute monitor in the fleet the fast loop owns the due
++            // pass. Running it here too would double-check the same monitor on
++            // the ticks where both loops land together.
++            if (strict && !fast) {
+                 runCatchingCancellable { graph.engine.runAllDue() }
+                     .onFailure { Diag.logError(LogEvent.CHECK_FAILED, it, LogField.tag("at", "service_pass")) }
+             }
+@@ -309,6 +319,67 @@ class NightbellMonitorService : Service() {
+         }
+     }
+ 
++    /**
++     * Holds sub-minute cadences.
++     *
++     * WorkManager's periodic floor is fifteen minutes, and the housekeeping loop
++     * above has to stay on its fifteen-second rhythm: posting the live
++     * notification or speaking a page once a second gets updates dropped by
++     * NotificationManager and burns the battery for no extra checks. So the
++     * checks get their own small loop — one due pass per fastest interval and
++     * nothing else. It re-reads the store on every pass, so disabling the last
++     * sub-minute monitor, or pausing checks, puts it straight back to sleep.
++     */
++    private suspend fun runFastLoop() {
++        val graph = Nightbell.install(applicationContext)
++        // Fixed-rate tick. Sleeping *after* the pass added the pass duration to
++        // the interval: a 1s monitor whose pass took 4s ran every 5s. Start the
++        // pass on an absolute tick instead, and drop a tick rather than queueing
++        // another pass while the previous one is still working. The engine's
++        // per-monitor mutex already prevents two checks of one monitor at once.
++        val passBusy = AtomicBoolean(false)
++        var nextTick = 0L
++        while (scope.isActive) {
++            val snapshot = runCatchingCancellable { graph.store.currentSnapshot() }.getOrNull()
++            val fastest = snapshot
++                ?.takeIf { !it.pause.stopsChecks(System.currentTimeMillis()) }
++                ?.monitors
++                ?.filter { it.runs && it.isSubMinute }
++                ?.minOfOrNull { it.intervalMs }
++            if (fastest == null) {
++                nextTick = 0L
++                delay(FAST_IDLE_MS)
++                continue
++            }
++            val tick = fastest.coerceAtLeast(1_000L)
++            val now = System.currentTimeMillis()
++            if (nextTick == 0L || now >= nextTick) {
++                nextTick = now + tick
++                if (passBusy.compareAndSet(false, true)) {
++                    scope.launch {
++                        try {
++                            // No external latency reference on the fast path: its
++                            // 4-second timeout is a whole cadence at 1s.
++                            runCatchingCancellable {
++                                graph.engine.runAllDue(refreshLatencyReference = false)
++                            }
++                                .onFailure {
++                                    Diag.logError(
++                                        LogEvent.CHECK_FAILED,
++                                        it,
++                                        LogField.tag("at", "fast_pass"),
++                                    )
++                                }
++                        } finally {
++                            passBusy.set(false)
++                        }
++                    }
++                }
++            }
++            delay((nextTick - System.currentTimeMillis()).coerceIn(1L, tick))
++        }
++    }
++
+     /**
+      * Posts the strict monitoring notice from the store as it is now.
+      *
+@@ -588,6 +659,9 @@ class NightbellMonitorService : Service() {
+ 
+         /** Four posts a second at most, under the platform's five. */
+         private const val MIN_NOTICE_GAP_MS = 250L
++
++        /** How often the fast loop looks for a sub-minute monitor when there is none. */
++        private const val FAST_IDLE_MS = 2_000L
+         const val ACTION_SYNC = "me.river.nightbell.action.SERVICE_SYNC"
+ 
+         /**
+@@ -610,7 +684,11 @@ class NightbellMonitorService : Service() {
+                 // the loop knowing about the pause, this went on starting the
+                 // service through one: promote to the foreground, notice there is
+                 // nothing to do, stop, and do it again on the next state change.
+-                val strict = snapshot.settings.strictForegroundMonitoring &&
++                // Same rule as the loop, including the sub-minute fleet: a
++                // one-second monitor needs this service engaged even when the
++                // global strict switch is off.
++                val fast = snapshot.monitors.any { it.enabled && it.isSubMinute }
++                val strict = (snapshot.settings.strictForegroundMonitoring || fast) &&
+                     snapshot.monitors.any { it.enabled } &&
+                     !snapshot.pause.stopsChecks(System.currentTimeMillis())
+                 val nagging = snapshot.monitors.any { monitor ->
+diff --git a/app/src/main/kotlin/me/river/nightbell/domain/CheckerHealth.kt b/app/src/main/kotlin/me/river/nightbell/domain/CheckerHealth.kt
+index e34b3db..0aa9c05 100644
+--- a/app/src/main/kotlin/me/river/nightbell/domain/CheckerHealth.kt
++++ b/app/src/main/kotlin/me/river/nightbell/domain/CheckerHealth.kt
+@@ -491,6 +491,12 @@ data class MonitorCadence(
+     val intervalMinutes: Int,
+     /** Age of the last completed check. Monitors never checked are simply omitted. */
+     val ageMs: Long,
++    /**
++     * The real cadence in milliseconds. Defaults from [intervalMinutes] so the
++     * callers (and tests) that only know about minutes keep working; the
++     * Android-side collector passes a sub-minute interval explicitly.
++     */
++    val intervalMs: Long = intervalMinutes.coerceAtLeast(1) * 60_000L,
+ )
+ 
+ /** The Android-side facts a limit verdict is derived from. Filled in by `SystemLimits`. */
+@@ -555,7 +561,7 @@ object CheckerLimits {
+ 
+     fun isLate(cadence: MonitorCadence): Boolean {
+         if (cadence.ageMs <= 0L) return false
+-        val interval = cadence.intervalMinutes.coerceAtLeast(1) * 60_000L
++        val interval = cadence.intervalMs.coerceAtLeast(1_000L)
+         val tolerance = maxOf(interval * DELAY_TOLERANCE_FACTOR, DELAY_FLOOR_MS)
+         return cadence.ageMs > tolerance
+     }
+diff --git a/app/src/main/kotlin/me/river/nightbell/domain/DataSaver.kt b/app/src/main/kotlin/me/river/nightbell/domain/DataSaver.kt
+index 0f59786..032ea14 100644
+--- a/app/src/main/kotlin/me/river/nightbell/domain/DataSaver.kt
++++ b/app/src/main/kotlin/me/river/nightbell/domain/DataSaver.kt
+@@ -127,7 +127,7 @@ object DataSaver {
+ 
+     /** (off, on) bytes a month for one monitor, each null until it has been measured. */
+     internal fun perMonth(monitor: Monitor, runtime: MonitorRuntime): Pair<Long?, Long?> {
+-        val checks = MONTH_DAYS * DAY_MS / (monitor.intervalMinutes.coerceAtLeast(1) * 60_000L)
++        val checks = MONTH_DAYS * DAY_MS / monitor.intervalMs
+         val full = runtime.bytesFull.takeIf { it > 0L }
+         val saver = runtime.bytesSaver.takeIf { it > 0L }
+         // A ping or a bare connection is a few hundred bytes the platform may not
+diff --git a/app/src/main/kotlin/me/river/nightbell/domain/DueCheck.kt b/app/src/main/kotlin/me/river/nightbell/domain/DueCheck.kt
+index a3222ae..792d860 100644
+--- a/app/src/main/kotlin/me/river/nightbell/domain/DueCheck.kt
++++ b/app/src/main/kotlin/me/river/nightbell/domain/DueCheck.kt
+@@ -25,7 +25,21 @@ object DueCheck {
+      * @param lastCheckedAt wall-clock millis of the last completed check; 0 means
+      *   never checked, which is always due.
+      */
+-    fun isDue(intervalMinutes: Int, lastCheckedAt: Long, nowMs: Long): Boolean {
++    fun isDue(intervalMinutes: Int, lastCheckedAt: Long, nowMs: Long): Boolean =
++        isDueMillis(intervalMinutes.coerceAtLeast(1) * 60_000L, lastCheckedAt, nowMs)
++
++    /**
++     * Slack, scaled to the interval. The flat 30 seconds is right for a
++     * quarter-hour cadence but nonsense for a one-second one: subtract 30 seconds
++     * from a 1,000ms interval and the monitor is permanently due, so the loop
++     * would check it on every single tick no matter what the user chose. Half the
++     * interval is the most a check may land early, and for anything a minute or
++     * longer this is still the original 30 seconds.
++     */
++    fun slackFor(intervalMs: Long): Long = minOf(SLACK_MS, intervalMs / 2L)
++
++    /** The millisecond form, shared by minute and second cadences. */
++    fun isDueMillis(intervalMs: Long, lastCheckedAt: Long, nowMs: Long): Boolean {
+         if (lastCheckedAt <= 0L) return true
+         val since = nowMs - lastCheckedAt
+         // A negative age means the wall clock moved *backwards* — someone changed
+@@ -35,6 +49,7 @@ object DueCheck {
+         // that window would never alert. A stamp in the future is due now; the
+         // check that follows re-bases it.
+         if (since < 0L) return true
+-        return since >= intervalMinutes.coerceAtLeast(1) * 60_000L - SLACK_MS
++        val interval = intervalMs.coerceAtLeast(1_000L)
++        return since >= interval - slackFor(interval)
+     }
+ }
+diff --git a/app/src/main/kotlin/me/river/nightbell/domain/LiveTimeline.kt b/app/src/main/kotlin/me/river/nightbell/domain/LiveTimeline.kt
+index 0bf3ecf..41fdc4a 100644
+--- a/app/src/main/kotlin/me/river/nightbell/domain/LiveTimeline.kt
++++ b/app/src/main/kotlin/me/river/nightbell/domain/LiveTimeline.kt
+@@ -502,9 +502,9 @@ object LiveTimeline {
+         runtimes: Map<String, MonitorRuntime>,
+         nowMs: Long,
+     ): Pacing {
+-        val pacer = active.minWithOrNull(compareBy({ it.intervalMinutes }, { it.id }))
++        val pacer = active.minWithOrNull(compareBy({ it.intervalMs }, { it.id }))
+             ?: return Pacing(waitMs = 0L, intervalMs = 60_000L)
+-        val intervalMs = pacer.intervalMinutes.coerceAtLeast(1) * 60_000L
++        val intervalMs = pacer.intervalMs
+         val last = runtimes[pacer.id]?.lastCheckedAt ?: 0L
+         // Never checked, or a stamp in the future because the wall clock moved
+         // backwards: due now, same as DueCheck decides.
+diff --git a/app/src/main/kotlin/me/river/nightbell/domain/Models.kt b/app/src/main/kotlin/me/river/nightbell/domain/Models.kt
+index 3e6937a..6c9167d 100644
+--- a/app/src/main/kotlin/me/river/nightbell/domain/Models.kt
++++ b/app/src/main/kotlin/me/river/nightbell/domain/Models.kt
+@@ -147,6 +147,17 @@ enum class MonitorKind {
+ 
+     /** Reaches a host directly rather than fetching a URL. See [NetworkWatch]. */
+     val isNetwork: Boolean get() = this == PING || this == TCP_PORT || this == UDP_PORT
++
++    /**
++     * Whether this kind may be given a sub-minute interval. A GitHub poll spends
++     * up to four requests against a 60/hour anonymous budget, a mailbox check
++     * signs in every time, and a page-element check boots a WebView. A one-second
++     * cadence on any of those is an invitation to be throttled or locked out, so
++     * they stay on the minute scale even though the engine can run faster.
++     */
++    val supportsSubMinute: Boolean
++        get() = this != GITHUB_REPO && this != MAILBOX && this != WEBSITE_ELEMENT &&
++            this != UNSUPPORTED
+ }
+ 
+ @Serializable
+@@ -700,6 +711,18 @@ data class Monitor(
+     val mail: MailWatch = MailWatch(),
+     val timeoutSeconds: Int = 15,
+     val intervalMinutes: Int = 15,
++    /**
++     * A cadence measured in seconds. Zero means "use [intervalMinutes]", which
++     * is what every store written before sub-minute checks decodes to, so old
++     * backups keep their interval exactly. A positive value overrides
++     * [intervalMinutes] rather than adding to it: one number owns the cadence,
++     * and the two can never disagree about what the user asked for.
++     *
++     * Android's periodic work has a 15-minute floor, so a sub-minute monitor is
++     * driven by the foreground service loop instead; see
++     * `NightbellMonitorService` and `CheckEngine.FAST_TICK_MS`.
++     */
++    val intervalSeconds: Int = 0,
+     /**
+      * Follow 3xx responses.
+      *
+@@ -876,6 +899,21 @@ data class Monitor(
+     fun withTargets(list: List<ElementTarget>): Monitor =
+         copy(elements = list, element = list.firstOrNull())
+ 
++    /**
++     * Effective cadence in milliseconds, whichever unit the user picked. Every
++     * due calculation, wake-up estimate and cadence display reads this, so a
++     * sub-minute monitor cannot quietly fall back to a minute somewhere.
++     */
++    val intervalMs: Long
++        get() = if (intervalSeconds > 0) {
++            intervalSeconds.coerceAtLeast(1) * 1000L
++        } else {
++            intervalMinutes.coerceAtLeast(1) * 60_000L
++        }
++
++    /** True when this monitor needs the fast foreground loop to hold its cadence. */
++    val isSubMinute: Boolean get() = intervalSeconds > 0
++
+     /** Effective latency budget, or 0 when neither monitor nor global sets one. */
+     fun sloMs(settings: GlobalSettings): Int =
+         if (latencySloMs > 0) latencySloMs else settings.defaultLatencySloMs
+@@ -1619,8 +1657,30 @@ enum class ThemeChoice {
+         }
+ }
+ 
++/**
++ * 应用内界面语言。独立于系统 locale，因为「跟随系统」是其中一个选项：
++ * 系统中文时想看英文、系统英文时想看中文，都不该要求改整个手机的设置。
++ *
++ * 持久化在 GlobalSettings 而不是单独一个 DataStore key，这样导出/导入备份
++ * 会带着这个偏好走，也跟 theme 的处理方式一致。带默认值，旧备份缺这个
++ * 字段时反序列化会补 SYSTEM，不需要迁移。
++ */
++@Serializable
++enum class LanguageChoice {
++    @SerialName("system")
++    SYSTEM,
++
++    @SerialName("zh")
++    ZH,
++
++    @SerialName("en")
++    EN,
++}
++
+ @Serializable
+ data class GlobalSettings(
++    /** See [LanguageChoice]. SYSTEM keeps the behaviour the app always had. */
++    val language: LanguageChoice = LanguageChoice.SYSTEM,
+     val masterAlertsEnabled: Boolean = true,
+     val defaultAlert: AlertPolicy = AlertPolicy(),
+     val backgroundChecksEnabled: Boolean = true,
+diff --git a/app/src/main/kotlin/me/river/nightbell/domain/Validation.kt b/app/src/main/kotlin/me/river/nightbell/domain/Validation.kt
+index c99ea53..45435d7 100644
+--- a/app/src/main/kotlin/me/river/nightbell/domain/Validation.kt
++++ b/app/src/main/kotlin/me/river/nightbell/domain/Validation.kt
+@@ -201,18 +201,19 @@ object Validation {
+             )
+         }
+ 
+-        // Cadence
+-        if (monitor.intervalMinutes < 1) {
+-            notes += Note(Field.INTERVAL, Severity.ERROR, "Interval must be at least 1 minute")
+-        } else if (monitor.intervalMinutes < 15) {
++        // Cadence. A sub-minute monitor deliberately keeps its minute field as
++        // a fallback for any older reader, so validity is decided by intervalMs.
++        if (monitor.intervalSeconds < 0 || (!monitor.isSubMinute && monitor.intervalMinutes < 1)) {
++            notes += Note(Field.INTERVAL, Severity.ERROR, "Interval must be at least 1 second")
++        } else if (monitor.intervalMs < 15 * 60_000L) {
+             notes += Note(
+                 Field.INTERVAL, Severity.HINT,
+-                "Android may batch background work; sub-15-minute checks are best-effort",
++                "Sub-15-minute checks run from a foreground service; a one-second cadence uses more battery",
+             )
+         }
+         if (monitor.timeoutSeconds < 1 || monitor.timeoutSeconds > 120) {
+             notes += Note(Field.TIMEOUT, Severity.ERROR, "Timeout must be 1–120 seconds")
+-        } else if (monitor.timeoutSeconds > monitor.intervalMinutes * 60) {
++        } else if (monitor.timeoutSeconds * 1000L > monitor.intervalMs) {
+             notes += Note(Field.TIMEOUT, Severity.WARNING, "Timeout is longer than the check interval")
+         }
+ 
+@@ -340,7 +341,9 @@ object Validation {
+         }
+         if (watch.staleAfterMinutes < 0) {
+             notes += Note(Field.STALE, Severity.ERROR, "The age limit can't be negative")
+-        } else if (watch.staleAfterMinutes in 1 until monitor.intervalMinutes) {
++        } else if (watch.staleAfterMinutes >= 1 &&
++            watch.staleAfterMinutes * 60_000L < monitor.intervalMs
++        ) {
+             notes += Note(
+                 Field.STALE, Severity.HINT,
+                 "Shorter than the check interval. Fine if the service refreshes its report more often than Nightbell reads it.",
+@@ -458,7 +461,7 @@ object Validation {
+                 "The author filter only applies to issues and pull requests",
+             )
+         }
+-        if (watch.notifyOnComments && monitor.intervalMinutes >= 15) {
++        if (watch.notifyOnComments && monitor.intervalMs >= 15 * 60_000L) {
+             // A hint rather than a warning: this configuration works, it just
+             // costs, and the interval warning above already covers the case where
+             // the cadence is the problem.
+@@ -468,7 +471,7 @@ object Validation {
+                     "gets 60 an hour, shared by every repository it watches.",
+             )
+         }
+-        if (monitor.intervalMinutes < 15) {
++        if (monitor.intervalMs < 15 * 60_000L) {
+             notes += Note(
+                 Field.INTERVAL, Severity.WARNING,
+                 "GitHub allows 60 requests an hour without a token, and one check spends up " +
+@@ -514,7 +517,7 @@ object Validation {
+                 "${literal.label} address, so the ${family.label} choice does not apply",
+             )
+         }
+-        if (monitor.intervalMinutes in 1 until 15) {
++        if (monitor.intervalMs in 60_000L until 15 * 60_000L) {
+             notes += Note(
+                 Field.INTERVAL, Severity.HINT,
+                 "Android may batch background work; sub-15-minute checks are best-effort",
+@@ -648,7 +651,7 @@ object Validation {
+         if (webmail.isNotEmpty() && !webmail.startsWith("https://") && !webmail.startsWith("http://")) {
+             notes += Note(Field.WEBMAIL, Severity.ERROR, "Start with https://")
+         }
+-        if (monitor.intervalMinutes in 1 until 5) {
++        if (monitor.intervalMs in 60_000L until 5 * 60_000L) {
+             notes += Note(
+                 Field.INTERVAL, Severity.HINT,
+                 "Every check signs in. Under 5 minutes fills the server's log and can trip its brute-force guard",
+@@ -667,8 +670,8 @@ object Validation {
+ 
+     private fun cadenceNotes(monitor: Monitor): List<Note> {
+         val notes = mutableListOf<Note>()
+-        if (monitor.intervalMinutes < 1) {
+-            notes += Note(Field.INTERVAL, Severity.ERROR, "Interval must be at least 1 minute")
++        if (monitor.intervalSeconds < 0 || (!monitor.isSubMinute && monitor.intervalMinutes < 1)) {
++            notes += Note(Field.INTERVAL, Severity.ERROR, "Interval must be at least 1 second")
+         }
+         if (monitor.timeoutSeconds < 1 || monitor.timeoutSeconds > 120) {
+             notes += Note(Field.TIMEOUT, Severity.ERROR, "Timeout must be 1 to 120 seconds")
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/NightbellApp.kt b/app/src/main/kotlin/me/river/nightbell/ui/NightbellApp.kt
+index 1ceaf91..0520d9c 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/NightbellApp.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/NightbellApp.kt
+@@ -33,12 +33,14 @@ import androidx.navigation.NavType
+ import androidx.navigation.navArgument
+ import me.river.nightbell.domain.AppUpdate
+ import me.river.nightbell.data.Nightbell
++import me.river.nightbell.ui.capture.CaptureScreen
+ import me.river.nightbell.ui.components.AuroraBackground
+ import me.river.nightbell.ui.components.DismissKeyboardOnOutsideTap
+ import me.river.nightbell.ui.components.ToastHost
+ import me.river.nightbell.ui.components.ToastMessage
+ import me.river.nightbell.ui.dashboard.DashboardScreen
+ import me.river.nightbell.ui.detail.DetailScreen
++import me.river.nightbell.ui.network.NetworkInfoScreen
+ import me.river.nightbell.ui.settings.SettingsScreen
+ import me.river.nightbell.ui.settings.WebhookEditorScreen
+ import me.river.nightbell.ui.setup.SetupScreen
+@@ -83,6 +85,12 @@ object Routes {
+     /** A webhook target. An empty id is a new one, so one route serves both. */
+     const val WEBHOOK = "webhook?id={id}"
+ 
++    /** Live interface capture -> pick a request -> turn it into a monitor. */
++    const val CAPTURE = "capture"
++
++    /** On-device readout of the connection the phone is actually using. */
++    const val NETWORK_INFO = "network-info"
++
+     /**
+      * Only ever called with false. The gate reaches the same destination as a
+      * start destination, which navigation resolves by pattern rather than by a
+@@ -310,6 +318,22 @@ private fun NightbellNavHost(
+                 onPickTemplate = { navController.navigate(Routes.setupNew(it)) },
+                 onOpenMonitor = { navController.navigate(Routes.detail(it)) },
+                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
++                onOpenCapture = { navController.navigate(Routes.CAPTURE) },
++                onOpenNetwork = { navController.navigate(Routes.NETWORK_INFO) },
++                onToast = onToast,
++            )
++        }
++
++        composable(Routes.CAPTURE) {
++            CaptureScreen(
++                onBack = { navController.popBackStack() },
++                onToast = onToast,
++            )
++        }
++
++        composable(Routes.NETWORK_INFO) {
++            NetworkInfoScreen(
++                onBack = { navController.popBackStack() },
+                 onToast = onToast,
+             )
+         }
+@@ -370,6 +394,8 @@ private fun NightbellNavHost(
+                 onToast = onToast,
+                 onOpenPagerSetup = { navController.navigate(Routes.pagerSetup(gate = false)) },
+                 onOpenWebhook = { navController.navigate(Routes.webhook(it)) },
++                onOpenCapture = { navController.navigate(Routes.CAPTURE) },
++                onOpenNetwork = { navController.navigate(Routes.NETWORK_INFO) },
+             )
+         }
+ 
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/NightbellSplash.kt b/app/src/main/kotlin/me/river/nightbell/ui/NightbellSplash.kt
+index 27e1f6c..3927379 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/NightbellSplash.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/NightbellSplash.kt
+@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.width
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/NightbellViewModels.kt b/app/src/main/kotlin/me/river/nightbell/ui/NightbellViewModels.kt
+index 67bed9d..7009475 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/NightbellViewModels.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/NightbellViewModels.kt
+@@ -1302,6 +1302,7 @@ class SetupViewModel(
+             } else {
+                 draft = draft.copy(
+                     intervalMinutes = snapshot.settings.defaultIntervalMinutes,
++                    intervalSeconds = 0,
+                     timeoutSeconds = snapshot.settings.defaultTimeoutSeconds,
+                     latencySloMs = 0,
+                     accent = snapshot.monitors.size,
+@@ -1951,6 +1952,10 @@ class SetupViewModel(
+ 
+             MonitorKind.UNSUPPORTED -> draft
+         }
++        // A GitHub poll, a mailbox sign-in and a WebView render cannot survive a
++        // one-second cadence. Drop the sub-minute override when switching to one
++        // of them rather than carrying it over and quietly hammering the service.
++        if (!kind.supportsSubMinute) draft = draft.copy(intervalSeconds = 0)
+         thresholdInput = PrometheusWatch.formatValue(draft.prometheus.threshold)
+         followSecret(secretBefore)
+         testResult = null
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/components/AlertPolicyEditor.kt b/app/src/main/kotlin/me/river/nightbell/ui/components/AlertPolicyEditor.kt
+index e3a0f4a..18e8cb1 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/components/AlertPolicyEditor.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/components/AlertPolicyEditor.kt
+@@ -21,7 +21,7 @@ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/components/Controls.kt b/app/src/main/kotlin/me/river/nightbell/ui/components/Controls.kt
+index 87e461d..4d9e413 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/components/Controls.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/components/Controls.kt
+@@ -45,7 +45,7 @@ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Switch
+ import androidx.compose.material3.SwitchDefaults
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.material3.ripple
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/components/Foundation.kt b/app/src/main/kotlin/me/river/nightbell/ui/components/Foundation.kt
+index b39301c..cadbe9a 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/components/Foundation.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/components/Foundation.kt
+@@ -32,7 +32,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.LocalContentColor
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.material3.ripple
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/components/HoldToConfirm.kt b/app/src/main/kotlin/me/river/nightbell/ui/components/HoldToConfirm.kt
+index 8d080fc..10bf8dc 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/components/HoldToConfirm.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/components/HoldToConfirm.kt
+@@ -17,7 +17,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.remember
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/components/Status.kt b/app/src/main/kotlin/me/river/nightbell/ui/components/Status.kt
+index c59b333..bcef9cf 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/components/Status.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/components/Status.kt
+@@ -38,7 +38,7 @@ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/components/Toast.kt b/app/src/main/kotlin/me/river/nightbell/ui/components/Toast.kt
+index e8ae085..d963c1e 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/components/Toast.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/components/Toast.kt
+@@ -30,7 +30,7 @@ import androidx.compose.foundation.layout.systemBars
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.Immutable
+ import androidx.compose.runtime.LaunchedEffect
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/DashboardScreen.kt b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/DashboardScreen.kt
+index 344686f..01bb8cc 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/DashboardScreen.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/DashboardScreen.kt
+@@ -54,7 +54,7 @@ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.material3.ripple
+ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+ import androidx.compose.ui.platform.LocalHapticFeedback
+@@ -186,6 +186,8 @@ fun DashboardScreen(
+     onOpenSettings: () -> Unit,
+     onToast: (ToastMessage) -> Unit,
+     onPickTemplate: (String) -> Unit = { onAddMonitor() },
++    onOpenCapture: () -> Unit = {},
++    onOpenNetwork: () -> Unit = {},
+ ) {
+     val viewModel = rememberDashboardViewModel()
+     val cards by viewModel.cards.collectAsStateWithLifecycle()
+@@ -435,6 +437,8 @@ fun DashboardScreen(
+                                 panel = if (panel == requested) DashboardPanel.NONE else requested
+                             },
+                             onOpenSettings = onOpenSettings,
++                            onOpenCapture = onOpenCapture,
++                            onOpenNetwork = onOpenNetwork,
+                         )
+                     }
+ 
+@@ -754,6 +758,8 @@ private fun DashboardHeader(
+     narrowing: Boolean,
+     onTogglePanel: (DashboardPanel) -> Unit,
+     onOpenSettings: () -> Unit,
++    onOpenCapture: () -> Unit = {},
++    onOpenNetwork: () -> Unit = {},
+ ) {
+     Row(
+         Modifier.fillMaxWidth(),
+@@ -787,6 +793,20 @@ private fun DashboardHeader(
+                 badged = narrowing,
+             )
+         }
++        GlassIconButton(
++            icon = NightbellIcons.Globe,
++            onClick = onOpenNetwork,
++            contentDescription = "Network info",
++            size = 34.dp,
++            accent = NightbellColors.TextSecondary,
++        )
++        GlassIconButton(
++            icon = NightbellIcons.Radar,
++            onClick = onOpenCapture,
++            contentDescription = "Interface capture",
++            size = 34.dp,
++            accent = NightbellColors.TextSecondary,
++        )
+         GlassIconButton(
+             icon = NightbellIcons.Sliders,
+             onClick = onOpenSettings,
+@@ -1889,7 +1909,11 @@ private fun MonitorRowCard(
+                 ) {
+                     MicroTag(text = monitor.method.name, color = NightbellColors.TextTertiary)
+                 }
+-                MicroTag(text = "${monitor.intervalMinutes}m", color = NightbellColors.TextTertiary, icon = NightbellIcons.Clock)
++                MicroTag(
++                    text = if (monitor.isSubMinute) "${monitor.intervalSeconds}s" else "${monitor.intervalMinutes}m",
++                    color = NightbellColors.TextTertiary,
++                    icon = NightbellIcons.Clock,
++                )
+             }
+             // Per-card actions step aside during selection: a re-check button that
+             // fires a real request is the last thing that should be one mis-tap
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/FleetBanner.kt b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/FleetBanner.kt
+index e8b8726..5bee60d 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/FleetBanner.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/FleetBanner.kt
+@@ -33,7 +33,7 @@ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import me.river.nightbell.domain.Health
+ import me.river.nightbell.domain.MonitorCard
+ import me.river.nightbell.domain.PauseScope
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupCard.kt b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupCard.kt
+index 5082444..0c5a2a5 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupCard.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupCard.kt
+@@ -32,7 +32,7 @@ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.material3.ripple
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupEditorDialog.kt b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupEditorDialog.kt
+index 8af1841..eb2f4ed 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupEditorDialog.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupEditorDialog.kt
+@@ -21,7 +21,7 @@ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupIconPicker.kt b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupIconPicker.kt
+index 8e9681f..821d84a 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupIconPicker.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupIconPicker.kt
+@@ -26,7 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.material3.ripple
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupTargetDialog.kt b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupTargetDialog.kt
+index 37e9cd4..215e452 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupTargetDialog.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/GroupTargetDialog.kt
+@@ -20,7 +20,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.material3.ripple
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.remember
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/PauseDialog.kt b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/PauseDialog.kt
+index 62ee4fd..bec2f0a 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/PauseDialog.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/PauseDialog.kt
+@@ -18,7 +18,7 @@ import androidx.compose.foundation.layout.widthIn
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Icon
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/UpdateBanner.kt b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/UpdateBanner.kt
+index c175ddf..8b93c0a 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/dashboard/UpdateBanner.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/dashboard/UpdateBanner.kt
+@@ -13,7 +13,7 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.layout.widthIn
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/detail/DetailScreen.kt b/app/src/main/kotlin/me/river/nightbell/ui/detail/DetailScreen.kt
+index 7f57bb2..70d6e28 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/detail/DetailScreen.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/detail/DetailScreen.kt
+@@ -32,7 +32,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.foundation.text.TextAutoSize
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.data.capture.MonitorLogEntry
++import me.river.nightbell.data.capture.MonitorLogRepository
++import me.river.nightbell.ui.i18n.L10n
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+@@ -47,6 +50,7 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.text.font.FontFamily
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+@@ -140,6 +144,7 @@ fun DetailScreen(
+     val card by viewModel.card.collectAsStateWithLifecycle()
+     val settings by viewModel.settings.collectAsStateWithLifecycle()
+     val offline by viewModel.offline.collectAsStateWithLifecycle()
++    val monitorLogs by MonitorLogRepository.state.collectAsStateWithLifecycle()
+     var showAllChecks by remember { mutableStateOf(false) }
+     /** Repository monitors show activity; this is the way back to the poll list. */
+     var showRawChecks by remember { mutableStateOf(false) }
+@@ -507,6 +512,16 @@ fun DetailScreen(
+             }
+         }
+ 
++        item(key = "request-logs") {
++            StaggeredEntrance(index = 5, key = "logs-${monitor.id}", log = entrance) {
++                RequestLogCard(
++                    monitorId = monitor.id,
++                    entries = MonitorLogRepository.forMonitor(monitor.id, monitorLogs),
++                    accent = accent,
++                )
++            }
++        }
++
+         item(key = "events-header") {
+             SectionHeader(
+                 if (repoHistory) "Repository activity" else "Recent checks",
+@@ -1001,27 +1016,43 @@ private fun CertificateCard(
+     }
+     GlassCard(accent = if (tone == NightbellColors.Mint) Color.Transparent else tone) {
+         SectionHeader("TLS certificate", icon = NightbellIcons.Shield, accent = tone)
+-        Row(verticalAlignment = Alignment.CenterVertically) {
+-            Column(Modifier.weight(1f)) {
+-                Text(
+-                    text = when {
+-                        expired -> "Expired ${formatSpan(nowMs - runtime.certExpiresAt)} ago"
+-                        days <= 0L -> "Expires today"
+-                        days == 1L -> "Expires tomorrow"
+-                        else -> "$days days left"
+-                    },
+-                    style = MaterialTheme.typography.titleLarge,
+-                    color = tone,
+-                )
++        // The issuer used to sit in this Row as an unconstrained MicroTag. A CA
++        // name is a long single-line string (e.g. "GeoTrust G2 TLS CN RSA4096
++        // SHA256 2022 CA1"); a Row measures non-weighted children first, so it
++        // swallowed the whole width and the weighted column collapsed to a few
++        // dp — "161 days left" and the date rendered one character per line.
++        // Keep the numeric reading on its own full-width column and put the
++        // issuer below it, wrapped and ellipsised instead of competing for space.
++        Column(Modifier.fillMaxWidth()) {
++            Text(
++                text = when {
++                    expired -> "Expired ${formatSpan(nowMs - runtime.certExpiresAt)} ago"
++                    days <= 0L -> "Expires today"
++                    days == 1L -> "Expires tomorrow"
++                    else -> "$days days left"
++                },
++                style = MaterialTheme.typography.titleLarge,
++                color = tone,
++                maxLines = 1,
++                overflow = TextOverflow.Ellipsis,
++            )
++            Text(
++                text = certDateFormat.format(Date(runtime.certExpiresAt)),
++                style = MaterialTheme.typography.bodySmall,
++                color = NightbellColors.TextTertiary,
++                maxLines = 1,
++                overflow = TextOverflow.Ellipsis,
++            )
++            if (runtime.certIssuer.isNotBlank()) {
++                Spacer(Modifier.height(8.dp))
+                 Text(
+-                    text = certDateFormat.format(Date(runtime.certExpiresAt)),
+-                    style = MaterialTheme.typography.bodySmall,
+-                    color = NightbellColors.TextTertiary,
++                    text = L10n.pick("Issuer: ", "颁发者：") + runtime.certIssuer,
++                    style = MaterialTheme.typography.labelSmall,
++                    color = NightbellColors.TextSecondary,
++                    maxLines = 2,
++                    overflow = TextOverflow.Ellipsis,
+                 )
+             }
+-            if (runtime.certIssuer.isNotBlank()) {
+-                MicroTag(runtime.certIssuer, color = NightbellColors.TextSecondary)
+-            }
+         }
+         if (expired) {
+             Spacer(Modifier.height(10.dp))
+@@ -1510,7 +1541,13 @@ private fun ConfigCard(
+                 }
+             }
+         }
+-        ConfigRow("Interval", "every ${monitor.intervalMinutes} min")
++        ConfigRow(
++            "Interval",
++            L10n.pick(
++                if (monitor.isSubMinute) "every ${monitor.intervalSeconds} s" else "every ${monitor.intervalMinutes} min",
++                if (monitor.isSubMinute) "每 ${monitor.intervalSeconds} 秒" else "每 ${monitor.intervalMinutes} 分钟",
++            ),
++        )
+         ConfigRow(
+             when (monitor.kind) {
+                 MonitorKind.PING -> "Reply timeout"
+@@ -1616,9 +1653,242 @@ private fun ConfigRow(label: String, value: String) {
+ 
+ private val certDateFormat = SimpleDateFormat("d MMM yyyy", Locale.getDefault())
+ private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
++/** Millisecond precision for the request log: a one-second cadence is invisible at HH:mm:ss. */
++private val logTimeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
+ private val dateFormat = SimpleDateFormat("d MMM", Locale.getDefault())
+ private val alertStartFormat = SimpleDateFormat("d MMM HH:mm", Locale.getDefault())
+ 
++/** Collapsed by default — a monitor card should stay a card, not a wall of text. */
++@Composable
++private fun RequestLogCard(
++    monitorId: String,
++    entries: List<MonitorLogEntry>,
++    accent: Color,
++) {
++    var expanded by rememberSaveable(monitorId) { mutableStateOf(false) }
++    var openId by rememberSaveable(monitorId) { mutableStateOf<String?>(null) }
++    GlassCard(onClick = { expanded = !expanded }, contentPadding = 12.dp) {
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Icon(
++                imageVector = NightbellIcons.History,
++                contentDescription = null,
++                tint = accent,
++                modifier = Modifier.size(18.dp),
++            )
++            Spacer(Modifier.width(10.dp))
++            Column(Modifier.weight(1f)) {
++                Text(
++                    text = L10n.pick("Request log", "请求日志"),
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = NightbellColors.TextPrimary,
++                )
++                Text(
++                    text = L10n.pick(
++                        "${entries.size} entries · tap to expand",
++                        "共 ${entries.size} 条 · 点开查看",
++                    ),
++                    style = MaterialTheme.typography.labelSmall,
++                    color = NightbellColors.TextTertiary,
++                )
++            }
++            Icon(
++                imageVector = if (expanded) NightbellIcons.ChevronUp else NightbellIcons.ChevronDown,
++                contentDescription = null,
++                tint = NightbellColors.TextTertiary,
++                modifier = Modifier.size(18.dp),
++            )
++        }
++        AnimatedVisibility(visible = expanded) {
++            Column {
++                Spacer(Modifier.height(8.dp))
++                if (entries.isEmpty()) {
++                    Text(
++                        text = L10n.pick(
++                            "No request recorded yet. Run a check to start the log.",
++                            "还没有请求记录，执行一次检查后即可查看。",
++                        ),
++                        style = MaterialTheme.typography.bodySmall,
++                        color = NightbellColors.TextTertiary,
++                    )
++                } else {
++                    val shown = entries.take(12)
++                    shown.forEachIndexed { index, entry ->
++                        // Entries are newest first. Printing the gap keeps the
++                        // configured cadence verifiable without mental arithmetic
++                        // on two HH:mm:ss timestamps rounded to whole seconds.
++                        val gapMs = shown.getOrNull(index + 1)
++                            ?.let { earlier -> entry.at - earlier.at }
++                            ?.takeIf { it >= 0L }
++                        MonitorLogRow(
++                            entry = entry,
++                            gapMs = gapMs,
++                            expanded = openId == entry.id,
++                            onToggle = { openId = if (openId == entry.id) null else entry.id },
++                        )
++                        if (index < shown.lastIndex) {
++                            GlassDivider(Modifier.padding(horizontal = 8.dp), alpha = 0.06f)
++                        }
++                    }
++                    Spacer(Modifier.height(8.dp))
++                    NightbellButton(
++                        text = L10n.pick("Clear this log", "清空此日志"),
++                        onClick = { MonitorLogRepository.clear(monitorId) },
++                        icon = NightbellIcons.Trash,
++                        tone = ButtonTone.Secondary,
++                        modifier = Modifier.fillMaxWidth(),
++                    )
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun MonitorLogRow(
++    entry: MonitorLogEntry,
++    gapMs: Long?,
++    expanded: Boolean,
++    onToggle: () -> Unit,
++) {
++    Column(
++        Modifier
++            .fillMaxWidth()
++            .clickable(onClick = onToggle)
++            .padding(horizontal = 8.dp, vertical = 9.dp),
++    ) {
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Text(
++                text = logTimeFormat.format(Date(entry.at)),
++                style = MaterialTheme.typography.labelSmall,
++                fontFamily = FontFamily.Monospace,
++                color = NightbellColors.TextTertiary,
++            )
++            if (gapMs != null) {
++                Spacer(Modifier.width(8.dp))
++                Text(
++                    text = "Δ " + if (gapMs >= 1_000L) {
++                        String.format(Locale.US, "%.2fs", gapMs / 1_000.0)
++                    } else {
++                        "${gapMs}ms"
++                    },
++                    style = MaterialTheme.typography.labelSmall,
++                    fontFamily = FontFamily.Monospace,
++                    color = if (gapMs > 2_000L) {
++                        NightbellColors.Amber
++                    } else {
++                        NightbellColors.TextTertiary
++                    },
++                )
++            }
++            Spacer(Modifier.width(10.dp))
++            val label = when {
++                entry.statusCode > 0 -> "HTTP ${entry.statusCode}"
++                entry.ok -> "OK"
++                else -> "FAILED"
++            }
++            Text(
++                text = label,
++                style = MaterialTheme.typography.labelSmall,
++                color = if (entry.ok) NightbellColors.Mint else NightbellColors.Rose,
++            )
++            Spacer(Modifier.width(10.dp))
++            Text(
++                text = "${entry.latencyMs} ms",
++                style = MaterialTheme.typography.labelSmall,
++                color = NightbellColors.TextTertiary,
++            )
++        }
++        val collapsed = entry.message.ifBlank { "${entry.method} ${entry.url}".trim() }
++        if (collapsed.isNotBlank()) {
++            Text(
++                text = collapsed,
++                style = MaterialTheme.typography.bodySmall,
++                color = NightbellColors.TextSecondary,
++                maxLines = if (expanded) 6 else 1,
++                overflow = TextOverflow.Ellipsis,
++            )
++        }
++        if (expanded) {
++            Spacer(Modifier.height(4.dp))
++            Text(
++                text = if (entry.source == "capture") {
++                    L10n.pick("captured exchange", "抓包请求")
++                } else {
++                    L10n.pick("scheduled / manual check", "定时或手动检查")
++                },
++                style = MaterialTheme.typography.labelSmall,
++                color = NightbellColors.TextTertiary,
++            )
++            if (entry.requestHeaders.isNotEmpty()) {
++                Spacer(Modifier.height(6.dp))
++                Text(
++                    text = L10n.pick("Request headers", "请求头"),
++                    style = MaterialTheme.typography.labelSmall,
++                    color = NightbellColors.TextTertiary,
++                )
++                Text(
++                    text = entry.requestHeaders.joinToString("\n").take(4000),
++                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
++                    color = NightbellColors.TextSecondary,
++                )
++            }
++            if (entry.requestBody.isNotBlank()) {
++                Spacer(Modifier.height(6.dp))
++                Text(
++                    text = L10n.pick("Request body", "请求体"),
++                    style = MaterialTheme.typography.labelSmall,
++                    color = NightbellColors.TextTertiary,
++                )
++                Text(
++                    text = entry.requestBody.take(4000),
++                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
++                    color = NightbellColors.TextSecondary,
++                )
++            }
++            if (entry.responseHeaders.isNotEmpty()) {
++                Spacer(Modifier.height(6.dp))
++                Text(
++                    text = L10n.pick("Response headers", "响应头"),
++                    style = MaterialTheme.typography.labelSmall,
++                    color = NightbellColors.TextTertiary,
++                )
++                Text(
++                    text = entry.responseHeaders.joinToString("\n").take(4000),
++                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
++                    color = NightbellColors.TextSecondary,
++                )
++            }
++            val response = entry.responseBody.ifBlank { entry.bodyPreview }
++            if (response.isNotBlank()) {
++                Spacer(Modifier.height(6.dp))
++                Text(
++                    text = L10n.pick("Response", "响应"),
++                    style = MaterialTheme.typography.labelSmall,
++                    color = NightbellColors.TextTertiary,
++                )
++                Text(
++                    text = response.take(4000),
++                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
++                    color = NightbellColors.TextSecondary,
++                )
++            }
++            if (entry.detail.isNotBlank()) {
++                Spacer(Modifier.height(6.dp))
++                Text(
++                    text = L10n.pick("Detail", "详情"),
++                    style = MaterialTheme.typography.labelSmall,
++                    color = NightbellColors.TextTertiary,
++                )
++                Text(
++                    text = entry.detail.take(4000),
++                    style = MaterialTheme.typography.labelSmall,
++                    color = NightbellColors.TextSecondary,
++                )
++            }
++        }
++    }
++}
++
+ @Composable
+ private fun EventRow(sample: Sample) {
+     Row(
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/detail/HealthReport.kt b/app/src/main/kotlin/me/river/nightbell/ui/detail/HealthReport.kt
+index 1eae6fd..820ba68 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/detail/HealthReport.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/detail/HealthReport.kt
+@@ -28,7 +28,8 @@ import androidx.compose.material3.ExperimentalMaterial3Api
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.ModalBottomSheet
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.L10n
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.material3.rememberModalBottomSheetState
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+@@ -475,7 +476,12 @@ internal fun HealthChecksCard(monitor: Monitor, samples: List<Sample>) {
+         }
+         Spacer(Modifier.height(10.dp))
+         Text(
+-            text = "$passed of ${shown.size} passed · every ${monitor.intervalMinutes} min",
++            text = L10n.pick(
++                "$passed of ${shown.size} passed · " +
++                    (if (monitor.isSubMinute) "every ${monitor.intervalSeconds} s" else "every ${monitor.intervalMinutes} min"),
++                "$passed / ${shown.size} 项通过 · " +
++                    (if (monitor.isSubMinute) "每 ${monitor.intervalSeconds} 秒" else "每 ${monitor.intervalMinutes} 分钟"),
++            ),
+             style = MaterialTheme.typography.bodySmall.tabular(),
+             color = NightbellColors.TextTertiary,
+         )
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/detail/MailReport.kt b/app/src/main/kotlin/me/river/nightbell/ui/detail/MailReport.kt
+index bf8503c..9c4db81 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/detail/MailReport.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/detail/MailReport.kt
+@@ -9,7 +9,7 @@ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/detail/NetworkReport.kt b/app/src/main/kotlin/me/river/nightbell/ui/detail/NetworkReport.kt
+index 3efaeda..9b461bd 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/detail/NetworkReport.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/detail/NetworkReport.kt
+@@ -13,7 +13,7 @@ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/detail/UdpReport.kt b/app/src/main/kotlin/me/river/nightbell/ui/detail/UdpReport.kt
+index 5792ba6..a622eeb 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/detail/UdpReport.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/detail/UdpReport.kt
+@@ -5,7 +5,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/permissions/PagerSetupScreen.kt b/app/src/main/kotlin/me/river/nightbell/ui/permissions/PagerSetupScreen.kt
+index d13b4f4..68d7f07 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/permissions/PagerSetupScreen.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/permissions/PagerSetupScreen.kt
+@@ -26,7 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/settings/HelpSection.kt b/app/src/main/kotlin/me/river/nightbell/ui/settings/HelpSection.kt
+index 8d89002..d0c9770 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/settings/HelpSection.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/settings/HelpSection.kt
+@@ -19,7 +19,7 @@ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/settings/LiveCardSettings.kt b/app/src/main/kotlin/me/river/nightbell/ui/settings/LiveCardSettings.kt
+index 52755fd..322ab31 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/settings/LiveCardSettings.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/settings/LiveCardSettings.kt
+@@ -19,7 +19,7 @@ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Alignment
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/settings/SettingsScreen.kt b/app/src/main/kotlin/me/river/nightbell/ui/settings/SettingsScreen.kt
+index 6a82897..e9be61d 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/settings/SettingsScreen.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/settings/SettingsScreen.kt
+@@ -72,7 +72,7 @@ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Slider
+ import androidx.compose.material3.SliderDefaults
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
+@@ -103,6 +103,7 @@ import me.river.nightbell.domain.PauseScope
+ import me.river.nightbell.domain.ProxyRoute
+ import me.river.nightbell.domain.ConnectivityReference
+ import me.river.nightbell.domain.GitHubWatch
++import me.river.nightbell.domain.LanguageChoice
+ import me.river.nightbell.domain.ThemeChoice
+ import me.river.nightbell.domain.UpdateSource
+ import me.river.nightbell.ui.update.UpdateActions
+@@ -133,6 +134,7 @@ import me.river.nightbell.ui.components.HoldToConfirmButton
+ import me.river.nightbell.data.alerts.PageSpeaker
+ import me.river.nightbell.domain.SpokenPage
+ import me.river.nightbell.ui.icons.NightbellIcons
++import me.river.nightbell.ui.i18n.L10n
+ import me.river.nightbell.ui.rememberSettingsViewModel
+ import me.river.nightbell.ui.theme.Backdrop
+ import me.river.nightbell.ui.theme.LocalNightbellMotion
+@@ -157,6 +159,8 @@ fun SettingsScreen(
+     onOpenPagerSetup: () -> Unit = {},
+     /** Null opens a new one. */
+     onOpenWebhook: (String?) -> Unit = {},
++    onOpenCapture: () -> Unit = {},
++    onOpenNetwork: () -> Unit = {},
+ ) {
+     val viewModel = rememberSettingsViewModel()
+     val webhookRows by viewModel.webhookRows.collectAsStateWithLifecycle()
+@@ -889,6 +893,57 @@ fun SettingsScreen(
+             }
+     }
+     val checksItems: LazyListScope.() -> Unit = {
++            item(key = "interface-capture") {
++                StaggeredEntrance(index = 0, key = "interface-capture", log = entrance) {
++                    GlassCard(onClick = onOpenCapture) {
++                        SectionHeader(
++                            "Interface capture",
++                            icon = NightbellIcons.Radar,
++                            accent = NightbellColors.Aqua,
++                        )
++                        Text(
++                            text = "Discover the API endpoints your phone calls, then pick which ones to test or monitor.",
++                            style = MaterialTheme.typography.bodySmall,
++                            color = NightbellColors.TextSecondary,
++                        )
++                        Spacer(Modifier.height(8.dp))
++                        NightbellButton(
++                            text = "Open capture",
++                            onClick = onOpenCapture,
++                            icon = NightbellIcons.Play,
++                            modifier = Modifier.fillMaxWidth(),
++                        )
++                    }
++                }
++            }
++
++            item(key = "network-info") {
++                StaggeredEntrance(index = 0, key = "network-info", log = entrance) {
++                    GlassCard(onClick = onOpenNetwork) {
++                        SectionHeader(
++                            L10n.pick("NETWORK INFO", "网络信息"),
++                            icon = NightbellIcons.Globe,
++                            accent = NightbellColors.Sky,
++                        )
++                        Text(
++                            text = L10n.pick(
++                                "See the current connection: local IPs, DNS, gateway, Wi-Fi and cellular signal, bandwidth and traffic.",
++                                "查看当前连接：本机 IP、DNS、网关、Wi-Fi 与蜂窝信号、带宽和流量。",
++                            ),
++                            style = MaterialTheme.typography.bodySmall,
++                            color = NightbellColors.TextSecondary,
++                        )
++                        Spacer(Modifier.height(8.dp))
++                        NightbellButton(
++                            text = L10n.pick("Open network info", "查看网络信息"),
++                            onClick = onOpenNetwork,
++                            icon = NightbellIcons.Globe,
++                            modifier = Modifier.fillMaxWidth(),
++                        )
++                    }
++                }
++            }
++
+             item(key = "scheduling") {
+                 StaggeredEntrance(index = 0, key = "scheduling", log = entrance) {
+                     GlassCard {
+@@ -1320,6 +1375,35 @@ fun SettingsScreen(
+             }
+     }
+     val lookItems: LazyListScope.() -> Unit = {
++            item(key = "language") {
++                StaggeredEntrance(index = 4, key = "language", log = entrance) {
++                    GlassCard {
++                        SectionHeader("Language", icon = NightbellIcons.Globe, accent = NightbellColors.Aqua)
++                        Text(
++                            text = "Pick the language Nightbell uses. Follow system tracks the phone; the switch takes effect immediately and travels with your backups.",
++                            style = MaterialTheme.typography.bodySmall,
++                            color = NightbellColors.TextTertiary,
++                        )
++                        Spacer(Modifier.height(12.dp))
++                        SegmentedSelector(
++                            options = LanguageChoice.entries.toList(),
++                            selected = settings.language,
++                            // updateText, not update: a language choice changes no
++                            // schedule, so rebuilding every monitor's work request
++                            // and clearing checker health would be pure collateral.
++                            onSelect = { choice -> viewModel.updateText { it.copy(language = choice) } },
++                            label = { choice ->
++                                when (choice) {
++                                    LanguageChoice.SYSTEM -> L10n.pick("System", "跟随系统")
++                                    LanguageChoice.ZH -> "中文"
++                                    LanguageChoice.EN -> "English"
++                                }
++                            },
++                            modifier = Modifier.testTag("language-selector"),
++                        )
++                    }
++                }
++            }
+             item(key = "appearance") {
+                 StaggeredEntrance(index = 0, key = "appearance", log = entrance) {
+                     GlassCard {
+@@ -1438,6 +1522,7 @@ fun SettingsScreen(
+                     )
+                 }
+             }
++
+     }
+     val aboutItems: LazyListScope.() -> Unit = {
+             item(key = "updates") {
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/settings/WebhookEditor.kt b/app/src/main/kotlin/me/river/nightbell/ui/settings/WebhookEditor.kt
+index a455e7a..1292081 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/settings/WebhookEditor.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/settings/WebhookEditor.kt
+@@ -27,7 +27,7 @@ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.foundation.layout.isImeVisible
+ import androidx.compose.ui.layout.positionInParent
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/setup/ElementPicker.kt b/app/src/main/kotlin/me/river/nightbell/ui/setup/ElementPicker.kt
+index a5e063a..b5c39c7 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/setup/ElementPicker.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/setup/ElementPicker.kt
+@@ -45,7 +45,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/setup/HealthSetup.kt b/app/src/main/kotlin/me/river/nightbell/ui/setup/HealthSetup.kt
+index d14146b..351fac1 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/setup/HealthSetup.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/setup/HealthSetup.kt
+@@ -8,7 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/setup/MailSetup.kt b/app/src/main/kotlin/me/river/nightbell/ui/setup/MailSetup.kt
+index c5899ee..2b6c9c4 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/setup/MailSetup.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/setup/MailSetup.kt
+@@ -4,7 +4,7 @@ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/setup/NetworkSetup.kt b/app/src/main/kotlin/me/river/nightbell/ui/setup/NetworkSetup.kt
+index f81bdfe..7f2b48a 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/setup/NetworkSetup.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/setup/NetworkSetup.kt
+@@ -4,7 +4,7 @@ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/setup/SetupScreen.kt b/app/src/main/kotlin/me/river/nightbell/ui/setup/SetupScreen.kt
+index 99c21d9..0273b5c 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/setup/SetupScreen.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/setup/SetupScreen.kt
+@@ -50,7 +50,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.L10n
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+@@ -1825,24 +1826,88 @@ private fun StepSchedule(
+     accent: Color,
+ ) {
+     SectionHeader("Cadence", icon = NightbellIcons.Clock, accent = accent)
+-    StepperRow(
+-        title = "Check every",
+-        value = draft.intervalMinutes,
+-        onValueChange = { v -> viewModel.update { it.copy(intervalMinutes = v) } },
+-        range = 1..1440,
+-        step = 1,
+-        suffix = "m",
+-        icon = NightbellIcons.Clock,
+-        accent = accent,
+-        note = report.of(Validation.Field.INTERVAL),
+-    )
+-    ChipSelector(
+-        options = listOf(1, 5, 15, 30, 60, 180, 720),
+-        selected = draft.intervalMinutes,
+-        onSelect = { v -> viewModel.update { it.copy(intervalMinutes = v) } },
+-        label = { if (it >= 60) "${it / 60}h" else "${it}m" },
+-        accent = accent,
+-    )
++    // Two units for one number: a positive intervalSeconds overrides the minute
++    // field, which stays as a fallback any older reader can still understand.
++    val secondsAllowed = draft.kind.supportsSubMinute
++    val useSeconds = secondsAllowed && draft.isSubMinute
++    if (secondsAllowed) {
++        ChipSelector(
++            options = listOf(false, true),
++            selected = useSeconds,
++            onSelect = { seconds ->
++                viewModel.update {
++                    if (seconds) {
++                        it.copy(intervalSeconds = if (it.isSubMinute) it.intervalSeconds else 10)
++                    } else {
++                        it.copy(intervalSeconds = 0)
++                    }
++                }
++            },
++            label = { L10n.pick(if (it) "Seconds" else "Minutes", if (it) "秒" else "分钟") },
++            accent = accent,
++        )
++    }
++    if (useSeconds) {
++        StepperRow(
++            title = "Check every",
++            value = draft.intervalSeconds,
++            onValueChange = { v -> viewModel.update { it.copy(intervalSeconds = v) } },
++            range = 1..120,
++            step = 1,
++            suffix = "s",
++            icon = NightbellIcons.Clock,
++            accent = accent,
++            note = report.of(Validation.Field.INTERVAL),
++        )
++        ChipSelector(
++            options = listOf(1, 2, 5, 10, 15, 30, 60),
++            selected = draft.intervalSeconds,
++            onSelect = { v -> viewModel.update { it.copy(intervalSeconds = v) } },
++            label = { "${it}s" },
++            accent = accent,
++        )
++        Spacer(Modifier.height(8.dp))
++        Text(
++            text = L10n.pick(
++                "A sub-minute interval is held by a foreground service. " +
++                    "One second is useful on a LAN endpoint and costs noticeably more battery.",
++                "秒级间隔由前台服务常驻维持。1 秒适合内网接口测试，耗电会明显增加。",
++            ),
++            style = MaterialTheme.typography.bodySmall,
++            color = NightbellColors.TextTertiary,
++        )
++    } else {
++        StepperRow(
++            title = "Check every",
++            value = draft.intervalMinutes,
++            onValueChange = { v -> viewModel.update { it.copy(intervalMinutes = v) } },
++            range = 1..1440,
++            step = 1,
++            suffix = "m",
++            icon = NightbellIcons.Clock,
++            accent = accent,
++            note = report.of(Validation.Field.INTERVAL),
++        )
++        ChipSelector(
++            options = listOf(1, 5, 15, 30, 60, 180, 720),
++            selected = draft.intervalMinutes,
++            onSelect = { v -> viewModel.update { it.copy(intervalMinutes = v) } },
++            label = { if (it >= 60) "${it / 60}h" else "${it}m" },
++            accent = accent,
++        )
++        if (!secondsAllowed) {
++            Spacer(Modifier.height(8.dp))
++            Text(
++                text = L10n.pick(
++                    "This kind of check stays on a minute-scale interval: each run " +
++                        "is expensive enough that a one-second cadence would be rate-limited.",
++                    "此类监控保持分钟级间隔：每次检查成本较高，1 秒频率会触发限流。",
++                ),
++                style = MaterialTheme.typography.bodySmall,
++                color = NightbellColors.TextTertiary,
++            )
++        }
++    }
+     StepperRow(
+         // For a ping it is how long each reply is waited for, and the name says
+         // so: three packets at fifteen seconds is not a fifteen second check.
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/setup/SsoSignIn.kt b/app/src/main/kotlin/me/river/nightbell/ui/setup/SsoSignIn.kt
+index df0cbe0..e10f351 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/setup/SsoSignIn.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/setup/SsoSignIn.kt
+@@ -28,7 +28,7 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.statusBars
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/setup/UdpSetup.kt b/app/src/main/kotlin/me/river/nightbell/ui/setup/UdpSetup.kt
+index cbeabd8..613c27d 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/setup/UdpSetup.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/setup/UdpSetup.kt
+@@ -4,7 +4,7 @@ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/setup/UdpTestProgress.kt b/app/src/main/kotlin/me/river/nightbell/ui/setup/UdpTestProgress.kt
+index 95c2240..f3878cb 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/setup/UdpTestProgress.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/setup/UdpTestProgress.kt
+@@ -11,7 +11,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/update/UpdateActions.kt b/app/src/main/kotlin/me/river/nightbell/ui/update/UpdateActions.kt
+index 1018089..d261d3f 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/update/UpdateActions.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/update/UpdateActions.kt
+@@ -18,7 +18,7 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.Immutable
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/kotlin/me/river/nightbell/ui/urgent/UrgentAlertScreen.kt b/app/src/main/kotlin/me/river/nightbell/ui/urgent/UrgentAlertScreen.kt
+index 8522912..e0b2c73 100644
+--- a/app/src/main/kotlin/me/river/nightbell/ui/urgent/UrgentAlertScreen.kt
++++ b/app/src/main/kotlin/me/river/nightbell/ui/urgent/UrgentAlertScreen.kt
+@@ -26,7 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+diff --git a/app/src/main/kotlin/me/river/nightbell/widget/WidgetConfigActivity.kt b/app/src/main/kotlin/me/river/nightbell/widget/WidgetConfigActivity.kt
+index 22fe905..3c9432a 100644
+--- a/app/src/main/kotlin/me/river/nightbell/widget/WidgetConfigActivity.kt
++++ b/app/src/main/kotlin/me/river/nightbell/widget/WidgetConfigActivity.kt
+@@ -32,7 +32,7 @@ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Slider
+ import androidx.compose.material3.SliderDefaults
+-import androidx.compose.material3.Text
++import me.river.nightbell.ui.i18n.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.collectAsState
+diff --git a/app/src/test/kotlin/me/river/nightbell/DueCheckTest.kt b/app/src/test/kotlin/me/river/nightbell/DueCheckTest.kt
+index 668a3fe..8b8d1f4 100644
+--- a/app/src/test/kotlin/me/river/nightbell/DueCheckTest.kt
++++ b/app/src/test/kotlin/me/river/nightbell/DueCheckTest.kt
+@@ -1,6 +1,8 @@
+ package me.river.nightbell
+ 
+ import me.river.nightbell.domain.DueCheck
++import me.river.nightbell.domain.Monitor
++import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+@@ -67,4 +69,33 @@ class DueCheckTest {
+         assertFalse(DueCheck.isDue(daily, now - 12 * 60 * minute, now))
+         assertTrue(DueCheck.isDue(daily, now - 24 * 60 * minute, now))
+     }
++
++    @Test
++    fun `a one-second cadence is honoured and its slack is scaled down`() {
++        val second = 1_000L
++        // The flat 30-second slack would leave a one-second monitor permanently
++        // due, so the loop would check it on every tick regardless of the choice.
++        assertEquals(500L, DueCheck.slackFor(second))
++        assertEquals(DueCheck.SLACK_MS, DueCheck.slackFor(15 * minute))
++        assertFalse(DueCheck.isDueMillis(second, now, now))
++        assertFalse(DueCheck.isDueMillis(second, now - 400L, now))
++        assertTrue(DueCheck.isDueMillis(second, now - 500L, now))
++        assertTrue(DueCheck.isDueMillis(second, now - second, now))
++        // Minute-scale cadences keep the old tolerance untouched.
++        assertTrue(DueCheck.isDueMillis(15 * minute, now - (15 * minute - DueCheck.SLACK_MS), now))
++    }
++
++    @Test
++    fun `intervalMs selects the second override and keeps old stores on minutes`() {
++        val old = Monitor(id = "old", name = "old", url = "https://old.example", intervalMinutes = 15)
++        assertEquals(15 * minute, old.intervalMs)
++        assertFalse(old.isSubMinute)
++
++        val fast = old.copy(intervalSeconds = 1)
++        assertEquals(1_000L, fast.intervalMs)
++        assertTrue(fast.isSubMinute)
++        // The minute field stays as a fallback for any reader that predates the
++        // sub-minute field, rather than being zeroed into nonsense.
++        assertEquals(15, fast.intervalMinutes)
++    }
+ }
+diff --git a/gradle.properties b/gradle.properties
+index 231283e..429c56e 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -11,3 +11,13 @@ android.suppressUnsupportedCompileSdk=36
+ 
+ kotlin.code.style=official
+ kotlin.incremental=true
++
++# Gradle 8.13 supports Java up to 23. Android Studio 2026.2.2 ships JBR 25,
++# which the IDE otherwise selects to run Gradle and which Gradle 8.13 refuses.
++# org.gradle.java.home takes precedence over JAVA_HOME for the Gradle daemon,
++# so both command-line builds and IDE syncs land on the same JDK 21.
++# Machine-local path: re-run tools/setup-android-env.ps1 after moving the JDK.
++org.gradle.java.home=D:/Android/jdk-21
++
++# Enabled parallel sync for Gradle 9.4+
++org.gradle.tooling.parallel=true

@@ -1,0 +1,7 @@
+# Kotlin / Python / Markdown are LF. Batch files must be CRLF: cmd.exe silently
+# mis-parses LF-only .bat files and breaks "cd" together with every relative path.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.patch text eol=lf

@@ -1,0 +1,26 @@
+# Build output — never committed
+build/
+app/build/
+/dist/
+*.apk
+*.aab
+*.log
+*.hprof
+
+# Signing material and machine-local configuration
+keystore/*.jks
+keystore/*.keystore
+keystore/keystore.properties
+local.properties
+.env
+.env.*
+
+# IDE and OS noise
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
